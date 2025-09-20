@@ -1,31 +1,62 @@
-# -*- coding: utf-8 -*-
+import numpy as np
 
-from pyfr.backends.base import ComputeMetaKernel
+from pyfr.backends.base import NullKernel
 from pyfr.solvers.base import BaseElements
 
 
 class BaseAdvectionElements(BaseElements):
+    def __init__(self, *kargs, **kwargs):
+        super().__init__(*kargs, **kwargs)
+
+        # Global kernel arguments
+        self._external_args = {}
+        self._external_vals = {}
+
+        # Source term kernel arguments
+        self._srctplargs = {
+            'ndims': self.ndims,
+            'nvars': self.nvars,
+            'src_macros': []
+        }
+
+        self._ploc_in_src_macros = False
+        self._soln_in_src_macros = False
+
+    @property
+    def has_src_macros(self):
+        return bool(self._srctplargs['src_macros'])
+
     @property
     def _scratch_bufs(self):
         if 'flux' in self.antialias:
-            bufs = {'scal_fpts', 'scal_qpts', 'vect_qpts'}
-        elif 'div-flux' in self.antialias:
-            bufs = {'scal_fpts', 'vect_upts', 'scal_qpts'}
+            return {'scal_fpts', 'scal_qpts', 'vect_qpts'}
         else:
-            bufs = {'scal_fpts', 'vect_upts'}
+            return {'scal_fpts', 'vect_upts'}
 
-        if self._soln_in_src_exprs:
-            if 'div-flux' in self.antialias:
-                bufs |= {'scal_qpts_cpy'}
-            else:
-                bufs |= {'scal_upts_cpy'}
+    def add_src_macro(self, mod, name, tplargs, ploc=False, soln=False):
+        self._ploc_in_src_macros |= ploc
+        self._soln_in_src_macros |= soln
 
-        return bufs
+        for m, n in self._srctplargs['src_macros']:
+            if m == mod or n == name:
+                raise RuntimeError(f'Aliased macros in src_macros: {name}')
 
-    def set_backend(self, *args, **kwargs):
-        super().set_backend(*args, **kwargs)
+        for k, v in tplargs.items():
+            if k in self._srctplargs and self._srctplargs[k] != v:
+                raise RuntimeError(f'Aliased terms in template args: {k}')
 
-        slicem = self._slice_mat
+        self._srctplargs['src_macros'].append((mod, name))
+        self._srctplargs |= tplargs
+
+    def _set_external(self, name, spec, value=None):
+        self._external_args[name] = spec
+
+        if value is not None:
+            self._external_vals[name] = value
+
+    def set_backend(self, backend, nscalupts, nonce, linoff):
+        super().set_backend(backend, nscalupts, nonce, linoff)
+
         kernels = self.kernels
 
         # Register pointwise kernels with the backend
@@ -33,104 +64,125 @@ class BaseAdvectionElements(BaseElements):
             'pyfr.solvers.baseadvec.kernels.negdivconf'
         )
 
+        self._be.pointwise.register(
+            'pyfr.solvers.baseadvec.kernels.evalsrcmacros'
+        )
+
         # What anti-aliasing options we're running with
         fluxaa = 'flux' in self.antialias
-        divfluxaa = 'div-flux' in self.antialias
-
-        # What the source term expressions (if any) are a function of
-        plocsrc = self._ploc_in_src_exprs
-        solnsrc = self._soln_in_src_exprs
-
-        # Source term kernel arguments
-        srctplargs = {
-            'ndims': self.ndims,
-            'nvars': self.nvars,
-            'srcex': self._src_exprs
-        }
 
         # Interpolation from elemental points
-        for s, neles in self._ext_int_sides:
-            if fluxaa or (divfluxaa and solnsrc):
-                kernels['disu_' + s] = lambda s=s: self._be.kernel(
-                    'mul', self.opmat('M8'), slicem(self.scal_upts_inb, s),
-                    out=slicem(self._scal_fqpts, s)
-                )
-            else:
-                kernels['disu_' + s] = lambda s=s: self._be.kernel(
-                    'mul', self.opmat('M0'), slicem(self.scal_upts_inb, s),
-                    out=slicem(self._scal_fpts, s)
-                )
+        kernels['disu'] = lambda uin: self._be.kernel(
+            'mul', self.opmat('M0'), self.scal_upts[uin],
+            out=self._scal_fpts
+        )
 
-        # Interpolations and projections to/from quadrature points
-        if divfluxaa:
-            kernels['tdivf_qpts'] = lambda: self._be.kernel(
-                'mul', self.opmat('M7'), self.scal_upts_outb,
+        if fluxaa and self.basis.order > 0:
+            kernels['qptsu'] = lambda uin: self._be.kernel(
+                'mul', self.opmat('M7'), self.scal_upts[uin],
                 out=self._scal_qpts
-            )
-            kernels['divf_upts'] = lambda: self._be.kernel(
-                'mul', self.opmat('M9'), self._scal_qpts,
-                out=self.scal_upts_outb
             )
 
         # First flux correction kernel
-        if fluxaa:
-            kernels['tdivtpcorf'] = lambda: self._be.kernel(
-                'mul', self.opmat('(M1 - M3*M2)*M10'), self._vect_qpts,
-                out=self.scal_upts_outb
+        if fluxaa and self.basis.order > 0:
+            kernels['tdivtpcorf'] = lambda fout: self._be.kernel(
+                'mul', self.opmat('(M1 - M3*M2)*M9'), self._vect_qpts,
+                out=self.scal_upts[fout]
             )
-        else:
-            kernels['tdivtpcorf'] = lambda: self._be.kernel(
+        elif self.basis.order > 0:
+            kernels['tdivtpcorf'] = lambda fout: self._be.kernel(
                 'mul', self.opmat('M1 - M3*M2'), self._vect_upts,
-                out=self.scal_upts_outb
+                out=self.scal_upts[fout]
             )
 
         # Second flux correction kernel
-        kernels['tdivtconf'] = lambda: self._be.kernel(
-            'mul', self.opmat('M3'), self._scal_fpts, out=self.scal_upts_outb,
-            beta=1.0
+        kernels['tdivtconf'] = lambda fout: self._be.kernel(
+            'mul', self.opmat('M3'), self._scal_fpts,
+            out=self.scal_upts[fout], beta=float(self.basis.order > 0)
         )
 
+        def copy_soln(uin):
+            if self._soln_in_src_macros:
+                return self._be.kernel('copy', self._scal_upts_cpy,
+                                       self.scal_upts[uin])
+            else:
+                return NullKernel()
+
+        kernels['copy_soln'] = copy_soln
+
         # Transformed to physical divergence kernel + source term
-        if divfluxaa:
-            plocqpts = self.ploc_at('qpts') if plocsrc else None
-            solnqpts = self._scal_qpts_cpy if solnsrc else None
+        kernels['negdivconf'] = lambda fout: self._be.kernel(
+            'negdivconf', tplargs=self._srctplargs,
+            dims=[self.nupts, self.neles], extrns=self._external_args,
+            tdivtconf=self.scal_upts[fout], rcpdjac=self.rcpdjac_at('upts'),
+            ploc=self.ploc_at('upts') if self._ploc_in_src_macros else None,
+            u=self._scal_upts_cpy if self._soln_in_src_macros else None,
+            **self._external_vals
+        )
 
-            if solnsrc:
-                kernels['copy_soln'] = lambda: self._be.kernel(
-                    'copy', self._scal_qpts_cpy, self._scal_qpts
-                )
-
-            kernels['negdivconf'] = lambda: self._be.kernel(
-                'negdivconf', tplargs=srctplargs,
-                dims=[self.nqpts, self.neles], tdivtconf=self._scal_qpts,
-                rcpdjac=self.rcpdjac_at('qpts'), ploc=plocqpts, u=solnqpts
-            )
-        else:
-            plocupts = self.ploc_at('upts') if plocsrc else None
-            solnupts = self._scal_upts_cpy if solnsrc else None
-
-            if solnsrc:
-                kernels['copy_soln'] = lambda: self._be.kernel(
-                    'copy', self._scal_upts_cpy, self.scal_upts_inb
-                )
-
-            kernels['negdivconf'] = lambda: self._be.kernel(
-                'negdivconf', tplargs=srctplargs,
-                dims=[self.nupts, self.neles], tdivtconf=self.scal_upts_outb,
-                rcpdjac=self.rcpdjac_at('upts'), ploc=plocupts, u=solnupts
-            )
+        kernels['evalsrcmacros'] = lambda uin: self._be.kernel(
+            'evalsrcmacros', tplargs=self._srctplargs,
+            dims=[self.nupts, self.neles], extrns=self._external_args,
+            ploc=self.ploc_at('upts') if self._ploc_in_src_macros else None,
+            u=self.scal_upts[uin],
+            **self._external_vals
+        )
 
         # In-place solution filter
         if self.cfg.getint('soln-filter', 'nsteps', '0'):
-            def filter_soln():
+            def modal_filter(uin):
                 mul = self._be.kernel(
-                    'mul', self.opmat('M11'), self.scal_upts_inb,
+                    'mul', self.opmat('M10'), self.scal_upts[uin],
                     out=self._scal_upts_temp
                 )
                 copy = self._be.kernel(
-                    'copy', self.scal_upts_inb, self._scal_upts_temp
+                    'copy', self.scal_upts[uin], self._scal_upts_temp
                 )
 
-                return ComputeMetaKernel([mul, copy])
+                return self._be.ordered_meta_kernel([mul, copy])
 
-            kernels['filter_soln'] = filter_soln
+            kernels['modal_filter'] = modal_filter
+
+        shock_capturing = self.cfg.get('solver', 'shock-capturing', 'none')
+        if shock_capturing == 'entropy-filter':
+            tags = {'align'}
+
+            # Allocate one minimum entropy value per interface
+            self.nfaces = len(self.nfacefpts)
+            ext = nonce + 'entmin_int'
+
+            # Set values to -inf for pre-proc filter to enforce positivity
+            entmin_int = np.full((self.nfaces, self.neles),
+                                 -self._be.fpdtype_max)
+            self.entmin_int = self._be.matrix((self.nfaces, self.neles),
+                                              tags=tags, extent=ext,
+                                              initval=entmin_int)
+
+            # Setup nodal/modal operator matrices
+            form = self.cfg.get('solver-entropy-filter', 'formulation',
+                                'nonlinear')
+            if form == 'linearised':
+                self.invvdm = self.vdm_ef = None
+            elif form == 'nonlinear':
+                self.invvdm = self._be.const_matrix(self.basis.ubasis.invvdm.T)
+                vdm_ef = self.basis.ubasis.vdm.T
+
+                if not self.basis.fpts_in_upts:
+                    vdmf = self.basis.ubasis.vdm_at(self.basis.fpts).T
+                    vdm_ef = np.vstack([vdm_ef, vdmf])
+
+                self.vdm_ef = self._be.const_matrix(vdm_ef)
+            else:
+                raise ValueError('Invalid entropy filter formulation.')
+
+            if self.basis.fpts_in_upts:
+                self.m0 = None
+            else:
+                self.m0 = self._be.const_matrix(self.basis.m0)
+
+    def get_entmin_int_fpts_for_inter(self, eidx, fidx):
+        return (self.entmin_int.mid,), (fidx,), (eidx,)
+
+    def get_entmin_bc_fpts_for_inter(self, eidx, fidx):
+        nfp = self.nfacefpts[fidx]
+        return (self.entmin_int.mid,)*nfp, (fidx,)*nfp, (eidx,)*nfp

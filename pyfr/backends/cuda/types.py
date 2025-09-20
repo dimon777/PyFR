@@ -1,25 +1,13 @@
-# -*- coding: utf-8 -*-
-
-from ctypes import c_int, c_ssize_t, c_void_p, pythonapi, py_object
+from functools import cached_property
 
 import numpy as np
-import pycuda.driver as cuda
 
 import pyfr.backends.base as base
-from pyfr.util import lazyprop
 
 
-_make_pybuf = pythonapi.PyMemoryView_FromMemory
-_make_pybuf.argtypes = [c_void_p, c_ssize_t, c_int]
-_make_pybuf.restype = py_object
-
-
-class _CUDAMatrixCommon(object):
-    @property
+class _CUDAMatrixCommon:
+    @cached_property
     def _as_parameter_(self):
-        return self.data
-
-    def __index__(self):
         return self.data
 
 
@@ -41,100 +29,93 @@ class CUDAMatrixBase(_CUDAMatrixCommon, base.MatrixBase):
         buf = np.empty((self.nrow, self.leaddim), dtype=self.dtype)
 
         # Copy
-        cuda.memcpy_dtoh(buf, self.data)
+        self.backend.cuda.memcpy(buf, self.data, self.nbytes)
 
         # Unpack
-        return self._unpack(buf[:, :self.ncol])
+        return self._unpack(buf)
 
     def _set(self, ary):
-        # Allocate a new buffer with suitable padding and pack it
-        buf = np.zeros((self.nrow, self.leaddim), dtype=self.dtype)
-        buf[:, :self.ncol] = self._pack(ary)
+        buf = self._pack(ary)
 
         # Copy
-        cuda.memcpy_htod(self.data, buf)
-
-
-class CUDAMatrix(CUDAMatrixBase, base.Matrix):
-    pass
+        self.backend.cuda.memcpy(self.data, buf, self.nbytes)
 
 
 class CUDAMatrixSlice(_CUDAMatrixCommon, base.MatrixSlice):
-    def _init_data(self, mat):
-        return (int(mat.basedata) + mat.offset +
-                self.ra*self.pitch + self.ca*self.itemsize)
+    @cached_property
+    def data(self):
+        return int(self.basedata) + self.offset
 
 
-class CUDAMatrixBank(base.MatrixBank):
-    def __index__(self):
-        return self._curr_mat.data
-
-
-class CUDAConstMatrix(CUDAMatrixBase, base.ConstMatrix):
-    pass
-
-
-class CUDAView(base.View):
-    pass
+class CUDAMatrix(CUDAMatrixBase, base.Matrix): pass
+class CUDAConstMatrix(CUDAMatrixBase, base.ConstMatrix): pass
+class CUDAView(base.View): pass
+class CUDAXchgView(base.XchgView): pass
 
 
 class CUDAXchgMatrix(CUDAMatrix, base.XchgMatrix):
-    def __init__(self, backend, ioshape, initval, extent, aliases, tags):
+    def __init__(self, backend, dtype, ioshape, initval, extent, aliases,
+                 tags):
         # Call the standard matrix constructor
-        super().__init__(backend, ioshape, initval, extent, aliases, tags)
+        super().__init__(backend, dtype, ioshape, initval, extent, aliases,
+                         tags)
 
-        # If MPI is CUDA-aware then construct a buffer out of our CUDA
-        # device allocation and pass this directly to MPI
+        # If MPI is CUDA-aware then simply annotate our device buffer
         if backend.mpitype == 'cuda-aware':
-            self.hdata = _make_pybuf(self.data, self.nbytes, 0x200)
+            class HostData:
+                __array_interface__ = {
+                    'version': 3,
+                    'typestr': np.dtype(self.dtype).str,
+                    'data': (self.data, False),
+                    'shape': (self.nrow, self.ncol)
+                }
+
+            self.hdata = np.array(HostData(), copy=False)
         # Otherwise, allocate a buffer on the host for MPI to send/recv from
         else:
-            self.hdata = cuda.pagelocked_empty((self.nrow, self.ncol),
-                                               self.dtype, 'C')
+            shape = (self.nrow, self.ncol)
+            self.hdata = backend.cuda.pagelocked_empty(shape, dtype)
 
 
-class CUDAXchgView(base.XchgView):
-    pass
+class CUDAGraph(base.Graph):
+    needs_pdeps = True
 
-
-class CUDAQueue(base.Queue):
     def __init__(self, backend):
         super().__init__(backend)
 
-        # CUDA streams
-        self.cuda_stream_comp = cuda.Stream()
-        self.cuda_stream_copy = cuda.Stream()
+        self.graph = backend.cuda.create_graph()
+        self.stale_kparams = {}
+        self.mpi_events = []
 
-    def _wait(self):
-        last = self._last
+    def add_mpi_req(self, req, deps=[]):
+        super().add_mpi_req(req, deps)
 
-        if last and last.ktype == 'compute':
-            self.cuda_stream_comp.synchronize()
-            self.cuda_stream_copy.synchronize()
-        elif last and last.ktype == 'mpi':
-            from mpi4py import MPI
+        if deps:
+            event = self.backend.cuda.create_event()
+            self.graph.add_event_record(event, [self.knodes[d] for d in deps])
 
-            MPI.Prequest.Waitall(self.mpi_reqs)
-            self.mpi_reqs = []
+            self.mpi_events.append((event, req))
 
-        self._last = None
+    def commit(self):
+        super().commit()
 
-    def _at_sequence_point(self, item):
-        return self._last and self._last.ktype != item.ktype
+        self.exc_graph = self.graph.instantiate()
 
-    @staticmethod
-    def runall(queues):
-        # First run any items which will not result in an implicit wait
-        for q in queues:
-            q._exec_nowait()
+    def run(self, stream):
+        # Ensure our kernel parameters are up to date
+        for node, params in self.stale_kparams.items():
+            self.exc_graph.set_kernel_node_params(node, params)
 
-        # So long as there are items remaining in the queues
-        while any(queues):
-            # Execute a (potentially) blocking item from each queue
-            for q in filter(None, queues):
-                q._exec_next()
-                q._exec_nowait()
+        self.exc_graph.launch(stream)
+        self.stale_kparams.clear()
 
-        # Wait for all tasks to complete
-        for q in queues:
-            q._wait()
+        # Start all dependency-free MPI requests
+        self._startall(self.mpi_root_reqs)
+
+        # Start any remaining requests once their dependencies are satisfied
+        for event, req in self.mpi_events:
+            event.synchronize()
+            req.Start()
+
+        # Wait for all of the MPI requests to finish
+        self._waitall(self.mpi_reqs)

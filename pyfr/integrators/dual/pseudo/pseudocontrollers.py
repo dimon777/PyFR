@@ -1,77 +1,71 @@
-# -*- coding: utf-8 -*-
-
 import numpy as np
 
 from pyfr.integrators.dual.pseudo.base import BaseDualPseudoIntegrator
-from pyfr.mpiutil import get_comm_rank_root, get_mpi
-from pyfr.util import memoize
+from pyfr.mpiutil import get_comm_rank_root, mpi
 
 
 class BaseDualPseudoController(BaseDualPseudoIntegrator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # Pseudo-step counter
-        self.npseudosteps = 0
+        # Ensure the system is compatible with our formulation
+        self.system.elementscls.validate_formulation(self)
 
         # Stats on the most recent step
         self.pseudostepinfo = []
 
-    @memoize
-    def _get_errest_kerns(self):
-        return self._get_kernels('errest', nargs=3, norm=self._pseudo_norm)
+    def convmon(self, i, minniters, dt_fac=1):
+        if i >= minniters - 1:
+            # Compute the normalised residual
+            resid = self._resid(self._idxcurr, self._idxprev, dt_fac)
 
-    def _resid(self, dtau, x):
+            self._update_pseudostepinfo(i + 1, resid)
+            return all(r <= t for r, t in zip(resid, self._pseudo_residtol))
+        else:
+            self._update_pseudostepinfo(i + 1, None)
+            return False
+
+    def commit(self):
+        self.system.commit()
+
+    def _resid(self, rcurr, rold, dt_fac):
         comm, rank, root = get_comm_rank_root()
 
-        # Get an errest kern to compute the square of the maximum residual
-        errest = self._get_errest_kerns()
+        # Get a set of kernels to compute the residual
+        rkerns = self._get_reduction_kerns(rcurr, rold, method='resid',
+                                           norm=self._pseudo_norm)
 
-        # Prepare and run the kernel
-        self._prepare_reg_banks(x, x, x)
-        self._queue % errest(dtau, 0.0)
+        # Bind the dynmaic arguments
+        for kern in rkerns:
+            kern.bind(dt_fac)
 
-        # L2 norm
+        # Run the kernels
+        self.backend.run_kernels(rkerns, wait=True)
+
+        # Pseudo L2 norm
         if self._pseudo_norm == 'l2':
             # Reduce locally (element types) and globally (MPI ranks)
-            res = np.array([sum(ev) for ev in zip(*errest.retval)])
-            comm.Allreduce(get_mpi('in_place'), res, op=get_mpi('sum'))
+            res = np.array([sum(e) for e in zip(*[r.retval for r in rkerns])])
+            comm.Allreduce(mpi.IN_PLACE, res, op=mpi.SUM)
 
             # Normalise and return
-            return np.sqrt(res / self._gndofs)
-        # L^∞ norm
+            return tuple(np.sqrt(res / self._gndofs))
+        # Uniform norm
         else:
             # Reduce locally (element types) and globally (MPI ranks)
-            res = np.array([max(ev) for ev in zip(*errest.retval)])
-            comm.Allreduce(get_mpi('in_place'), res, op=get_mpi('max'))
+            res = np.array([max(e) for e in zip(*[r.retval for r in rkerns])])
+            comm.Allreduce(mpi.IN_PLACE, res, op=mpi.MAX)
 
             # Normalise and return
-            return np.sqrt(res)
+            return tuple(np.sqrt(res))
+
+    def _update_pseudostepinfo(self, niters, resid):
+        self.pseudostepinfo.append((self.ntotiters, niters, resid))
 
 
 class DualNonePseudoController(BaseDualPseudoController):
     pseudo_controller_name = 'none'
-
-    @property
-    def _pseudo_controller_needs_lerrest(self):
-        return False
-
-    def convmon(self, i, minniters):
-        # Increment the step count
-        self.npseudosteps += 1
-
-        if i >= minniters - 1:
-            # Subtract the current solution from the previous solution
-            self._add(-1.0, self._idxprev, 1.0, self._idxcurr)
-
-            # Compute the normalised residual
-            resid = tuple(self._resid(self._dtau, self._idxprev))
-
-            self.pseudostepinfo.append((self.npseudosteps, i + 1, resid))
-            return all(r <= t for r, t in zip(resid, self._pseudo_residtol))
-        else:
-            self.pseudostepinfo.append((self.npseudosteps, i + 1, None))
-            return False
+    pseudo_controller_needs_lerrest = False
 
     def pseudo_advance(self, tcurr):
         self.tcurr = tcurr
@@ -81,15 +75,13 @@ class DualNonePseudoController(BaseDualPseudoController):
             self._idxcurr, self._idxprev = self.step(self.tcurr)
 
             # Convergence monitoring
-            if self.convmon(i, self.minniters):
+            if self.convmon(i, self.minniters, self._dtau):
                 break
-
-        # Update
-        self.finalise_pseudo_advance(self._idxcurr)
 
 
 class DualPIPseudoController(BaseDualPseudoController):
     pseudo_controller_name = 'local-pi'
+    pseudo_controller_needs_lerrest = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -100,13 +92,13 @@ class DualPIPseudoController(BaseDualPseudoController):
         if self._norm not in {'l2', 'uniform'}:
             raise ValueError('Invalid error norm')
 
-        tplargs = {'ndims': self.system.ndims, 'nvars': self.system.nvars}
+        tplargs = {'nvars': self.system.nvars}
 
         # Error tolerance
         tplargs['atol'] = self.cfg.getfloat(sect, 'atol')
 
         # PI control values
-        sord = self._pseudo_stepper_order
+        sord = self.pseudo_stepper_order
         tplargs['expa'] = self.cfg.getfloat(sect, 'pi-alpha', 0.7) / sord
         tplargs['expb'] = self.cfg.getfloat(sect, 'pi-beta', 0.4) / sord
 
@@ -116,6 +108,12 @@ class DualPIPseudoController(BaseDualPseudoController):
         tplargs['saff'] = self.cfg.getfloat(sect, 'safety-fact', 0.8)
         tplargs['dtau_maxf'] = self.cfg.getfloat(sect, 'pseudo-dt-max-mult',
                                                  3.0)
+
+        if not tplargs['minf'] < 1 <= tplargs['maxf']:
+            raise ValueError('Invalid pseudo max-fact, min-fact')
+
+        if tplargs['dtau_maxf'] < 1:
+            raise ValueError('Invalid pseudo-dt-max-mult')
 
         # Limits for the local pseudo-time-step size
         tplargs['dtau_min'] = self._dtau
@@ -127,49 +125,26 @@ class DualPIPseudoController(BaseDualPseudoController):
         )
 
         for ele, shape, dtaumat in zip(self.system.ele_map.values(),
-                                       self.system.ele_shapes, self.dtau_upts):
+                                       self.system.ele_shapes.values(),
+                                       self.dtau_upts):
             # Allocate storage for previous error
             err_prev = self.backend.matrix(shape, np.ones(shape),
                                            tags={'align'})
 
-            # Append the error kernels to the proxylist
-            self.pintgkernels['localerrest'].append(
-                self.backend.kernel(
-                    'localerrest', tplargs=tplargs,
-                    dims=[ele.nupts, ele.neles], err=ele.scal_upts_inb,
-                    errprev=err_prev, dtau_upts=dtaumat
+            # Append the error kernels to the list
+            for i, err in enumerate(ele.scal_upts):
+                self.pintgkernels['localerrest', i].append(
+                    self.backend.kernel(
+                        'localerrest', tplargs=tplargs,
+                        dims=[ele.nupts, ele.neles], err=err,
+                        errprev=err_prev, dtau_upts=dtaumat
+                    )
                 )
-            )
 
         self.backend.commit()
 
-    @property
-    def _pseudo_controller_needs_lerrest(self):
-        return True
-
     def localerrest(self, errbank):
-        self.system.eles_scal_upts_inb.active = errbank
-        self._queue % self.pintgkernels['localerrest']()
-
-    def convmon(self, i, minniters):
-        # Increment the step count
-        self.npseudosteps += 1
-
-        if i >= minniters - 1:
-            # Subtract the current solution from the previous solution
-            self._add(-1.0, self._idxprev, 1.0, self._idxcurr)
-
-            # Divide by 1/dtau
-            self.localdtau(self._idxprev, inv=1)
-
-            # Reduction
-            resid = tuple(self._resid(1.0, self._idxprev))
-
-            self.pseudostepinfo.append((self.npseudosteps, i + 1, resid))
-            return all(r <= t for r, t in zip(resid, self._pseudo_residtol))
-        else:
-            self.pseudostepinfo.append((self.npseudosteps, i + 1, None))
-            return False
+        self.backend.run_kernels(self.pintgkernels['localerrest', errbank])
 
     def pseudo_advance(self, tcurr):
         self.tcurr = tcurr
@@ -181,6 +156,3 @@ class DualPIPseudoController(BaseDualPseudoController):
 
             if self.convmon(i, self.minniters):
                 break
-
-        # Update
-        self.finalise_pseudo_advance(self._idxcurr)

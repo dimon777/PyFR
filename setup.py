@@ -1,24 +1,22 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
 import re
 from setuptools import setup
 import sys
 
 
-# Python version
-if sys.version_info[:2] < (3, 5):
-    print('PyFR requires Python 3.5 or newer')
-    sys.exit(-1)
+# Check Python version
+if sys.version_info < (3, 11):
+    sys.exit('Minimum Python version is 3.11')
+
 
 # PyFR version
 vfile = open('pyfr/_version.py').read()
 vsrch = re.search(r"^__version__ = ['\"]([^'\"]*)['\"]", vfile, re.M)
 
 if vsrch:
-    version = vsrch.group(1)
+    version = vsrch[1]
 else:
-    print('Unable to find a version string in pyfr/_version.py')
+    sys.exit('Unable to find a version string in pyfr/_version.py')
 
 # Modules
 modules = [
@@ -26,6 +24,10 @@ modules = [
     'pyfr.backends.base',
     'pyfr.backends.cuda',
     'pyfr.backends.cuda.kernels',
+    'pyfr.backends.hip',
+    'pyfr.backends.hip.kernels',
+    'pyfr.backends.metal',
+    'pyfr.backends.metal.kernels',
     'pyfr.backends.opencl',
     'pyfr.backends.opencl.kernels',
     'pyfr.backends.openmp',
@@ -36,10 +38,12 @@ modules = [
     'pyfr.integrators.dual.pseudo',
     'pyfr.integrators.dual.pseudo.kernels',
     'pyfr.integrators.std',
+    'pyfr.integrators.std.kernels',
+    'pyfr.partitioners',
     'pyfr.plugins',
+    'pyfr.plugins.kernels',
     'pyfr.quadrules',
     'pyfr.readers',
-    'pyfr.partitioners',
     'pyfr.solvers',
     'pyfr.solvers.aceuler',
     'pyfr.solvers.aceuler.kernels',
@@ -60,7 +64,8 @@ modules = [
     'pyfr.solvers.navstokes',
     'pyfr.solvers.navstokes.kernels',
     'pyfr.solvers.navstokes.kernels.bcs',
-    'pyfr.writers'
+    'pyfr.writers',
+    'pyfr.writers.vtk'
 ]
 
 # Tests
@@ -71,10 +76,13 @@ tests = [
 # Data
 package_data = {
     'pyfr.backends.cuda.kernels': ['*.mako'],
+    'pyfr.backends.hip.kernels': ['*.mako'],
+    'pyfr.backends.metal.kernels': ['*.mako'],
     'pyfr.backends.opencl.kernels': ['*.mako'],
     'pyfr.backends.openmp.kernels': ['*.mako'],
     'pyfr.integrators.dual.pseudo.kernels': ['*.mako'],
-    'pyfr.integrators.schemes': ['*.txt'],
+    'pyfr.integrators.std.kernels': ['*.mako'],
+    'pyfr.plugins.kernels': ['*.mako'],
     'pyfr.quadrules': [
         'hex/*.txt',
         'line/*.txt',
@@ -99,26 +107,21 @@ package_data = {
     'pyfr.tests': ['*.npz']
 }
 
-# Additional data
-data_files = [
-    ('', ['pyfr/__main__.py'])
-]
-
 # Hard dependencies
 install_requires = [
-    'appdirs >= 1.4.0',
-    'gimmik >= 2.0',
-    'h5py >= 2.6',
+    'gimmik >= 3.2.1',
+    'h5py >= 2.10',
     'mako >= 1.0.0',
-    'mpi4py >= 2.0',
-    'numpy >= 1.8',
-    'pytools >= 2016.2.1'
+    'mpi4py >= 4.0.0',
+    'numpy >= 2.2.5',
+    'platformdirs >= 2.2.0',
+    'pytools >= 2016.2.1',
+    'rtree >= 1.4.0'
 ]
 
 # Soft dependencies
 extras_require = {
-    'cuda': ['pycuda >= 2015.1'],
-    'opencl': ['pyopencl >= 2015.2.4']
+    'metal': ['pyobjc-framework-Metal >= 9.0']
 }
 
 # Scripts
@@ -130,9 +133,9 @@ console_scripts = [
 classifiers = [
     'License :: OSI Approved :: BSD License',
     'Programming Language :: Python',
-    'Programming Language :: Python :: 3.5',
-    'Programming Language :: Python :: 3.6',
-    'Programming Language :: Python :: 3.7',
+    'Programming Language :: Python :: 3.11',
+    'Programming Language :: Python :: 3.12',
+    'Programming Language :: Python :: 3.13',
     'Topic :: Scientific/Engineering'
 ]
 
@@ -144,20 +147,21 @@ grids containing various element types. It is also designed to target a
 range of hardware platforms via use of an in-built domain specific
 language derived from the Mako templating engine.'''
 
-setup(name='pyfr',
-      version=version,
-      description='Flux Reconstruction in Python',
-      long_description=long_description,
-      author='Imperial College London',
-      author_email='info@pyfr.org',
-      url='http://www.pyfr.org/',
-      license='BSD',
-      keywords='Math',
-      packages=['pyfr'] + modules + tests,
-      package_data=package_data,
-      data_files=data_files,
-      entry_points={'console_scripts': console_scripts},
-      install_requires=install_requires,
-      extras_require=extras_require,
-      classifiers=classifiers
+setup(
+    name='pyfr',
+    version=version,
+    description='Flux Reconstruction in Python',
+    long_description=long_description,
+    author='PyFR development team',
+    author_email='info@pyfr.org',
+    url='https://www.pyfr.org/',
+    license='BSD',
+    keywords='Math',
+    packages=['pyfr'] + modules + tests,
+    package_data=package_data,
+    entry_points={'console_scripts': console_scripts},
+    python_requires='>=3.11',
+    install_requires=install_requires,
+    extras_require=extras_require,
+    classifiers=classifiers
 )

@@ -1,13 +1,11 @@
-# -*- coding: utf-8 -*-
-
-from pkg_resources import resource_listdir, resource_string
+from importlib.resources import files
 import re
 
 import numpy as np
 
 
-class BaseTabulatedQuadRule(object):
-    def __init__(self, rule):
+class BaseTabulatedQuadRule:
+    def __init__(self, rule, flags=None):
         pts = []
         wts = []
 
@@ -37,24 +35,23 @@ class BaseTabulatedQuadRule(object):
         if self.ndim == 1:
             pts = [p[0] for p in pts]
 
-        # Cast
-        self.pts = np.array(pts, dtype=np.float)
-        self.wts = np.array(wts, dtype=np.float)
+        # Cast and assign
+        self.pts = np.array(pts)
+        self.wts = np.array(wts)
+        self.flags = frozenset(flags or '')
 
 
 class BaseStoredQuadRule(BaseTabulatedQuadRule):
     @classmethod
     def _iter_rules(cls):
-        rpaths = getattr(cls, '_rpaths', None)
-        if rpaths is None:
-            cls._rpaths = rpaths = resource_listdir(__name__, cls.shape)
+        if not hasattr(cls, '_rpaths'):
+            cls._rpaths = list(files(__name__).joinpath(cls.shape).iterdir())
 
-        for path in rpaths:
+        for path in cls._rpaths:
             m = re.match(r'([a-zA-Z0-9\-~+]+)-n(\d+)'
-                         r'(?:-d(\d+))?(?:-([spu]+))?\.txt$', path)
+                         r'(?:-d(\d+))?(?:-([pstu]+))?\.txt$', path.name)
             if m:
-                yield (path, m.group(1), int(m.group(2)),
-                       int(m.group(3) or -1), set(m.group(4) or ''))
+                yield (path, m[1], int(m[2]), int(m[3] or -1), set(m[4] or ''))
 
     def __init__(self, name=None, npts=None, qdeg=None, flags=None):
         if not npts and not qdeg:
@@ -71,15 +68,14 @@ class BaseStoredQuadRule(BaseTabulatedQuadRule):
                 if (not best or
                     (npts and rqdeg > best[2]) or
                     (qdeg and rnpts < best[1])):
-                    best = (rpath, rnpts, rqdeg)
+                    best = (rpath, rnpts, rqdeg, rflags)
 
         # Raise if no suitable rules were found
         if not best:
             raise ValueError('No suitable quadrature rule found')
 
         # Load the rule
-        rule = resource_string(__name__, '{}/{}'.format(self.shape, best[0]))
-        super().__init__(rule.decode('utf-8'))
+        super().__init__(best[0].read_text(), best[3])
 
 
 def get_quadrule(eletype, rule=None, npts=None, qdeg=None, flags=None):

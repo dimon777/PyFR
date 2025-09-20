@@ -1,57 +1,43 @@
-# -*- coding: utf-8 -*-
 <%inherit file='base'/>
 <%namespace module='pyfr.backends.base.makoutil' name='pyfr'/>
 
-void
-axnpby(int nrow, int ncolb, int ldim,
-       ${', '.join('fpdtype_t *__restrict__ x' + str(i) for i in range(nv))},
-       ${', '.join('fpdtype_t a' + str(i) for i in range(nv))})
+struct kargs
 {
-    #define X_IDX_AOSOA(v, nv) ((ci/SOA_SZ*(nv) + (v))*SOA_SZ + cj)
-    #pragma omp parallel
+    ixdtype_t nrow;
+    fpdtype_t ${','.join(f'*x{i}' for i in range(nv))};
+    fpdtype_t ${','.join(f'a{i}' for i in range(nv))};
+};
+
+void axnpby(int ib, const struct kargs *restrict args, int _disp_mask)
+{
+    ixdtype_t nrow = args->nrow;
+
+% for i in range(nv):
+    fpdtype_t *x${i} = args->x${i}, a${i} = args->a${i};
+% endfor
+
+% if sorted(subdims) == list(range(ncola)):
+    #pragma omp simd
+    for (ixdtype_t i = ib*nrow*BLK_SZ*${ncola}; i < (ib + 1)*nrow*BLK_SZ*${ncola}; i++)
+        x0[i] = ${pyfr.dot('a{l}', 'x{l}[i]', l=nv)};
+% else:
+    #define X_IDX_AOSOA(v, nv) ((_xi/SOA_SZ*(nv) + (v))*SOA_SZ + _xj)
+    for (ixdtype_t _y = 0; _y < nrow; _y++)
     {
-        int align = PYFR_ALIGN_BYTES / sizeof(fpdtype_t);
-        int rb, re, cb, ce, idx;
-        fpdtype_t axn;
-        loop_sched_2d(nrow, ncolb, align, &rb, &re, &cb, &ce);
-        int nci = ((ce - cb) / SOA_SZ)*SOA_SZ;
-
-        for (int r = rb; r < re; r++)
+        for (ixdtype_t _xi = 0; _xi < BLK_SZ; _xi += SOA_SZ)
         {
-            for (int ci = cb; ci < cb + nci; ci += SOA_SZ)
+            #pragma omp simd
+            for (ixdtype_t _xj = 0; _xj < SOA_SZ; _xj++)
             {
-                #pragma omp simd
-                for (int cj = 0; cj < SOA_SZ; cj++)
-                {
-                % for k in subdims:
-                    idx = r*ldim + X_IDX_AOSOA(${k}, ${ncola});
-                    axn = ${pyfr.dot('a{l}', 'x{l}[idx]', l=(1, nv))};
+                ixdtype_t i;
 
-                    if (a0 == 0.0)
-                        x0[idx] = axn;
-                    else if (a0 == 1.0)
-                        x0[idx] += axn;
-                    else
-                        x0[idx] = a0*x0[idx] + axn;
-                % endfor
-                }
-            }
-
-            for (int ci = cb + nci, cj = 0; cj < ce - ci; cj++)
-            {
             % for k in subdims:
-                idx = r*ldim + X_IDX_AOSOA(${k}, ${ncola});
-                axn = ${pyfr.dot('a{l}', 'x{l}[idx]', l=(1, nv))};
-
-                if (a0 == 0.0)
-                    x0[idx] = axn;
-                else if (a0 == 1.0)
-                    x0[idx] += axn;
-                else
-                    x0[idx] = a0*x0[idx] + axn;
+                i = _y*BLK_SZ*${ncola} + ib*BLK_SZ*${ncola}*nrow + X_IDX_AOSOA(${k}, ${ncola});
+                x0[i] = ${pyfr.dot('a{l}', 'x{l}[i]', l=nv)};
             % endfor
             }
         }
     }
     #undef X_IDX_AOSOA
+% endif
 }

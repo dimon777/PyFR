@@ -1,13 +1,7 @@
-# -*- coding: utf-8 -*-
-
 import numpy as np
-import pycuda.driver as cuda
-from pycuda.gpuarray import GPUArray
-from pycuda.reduction import ReductionKernel
 
-from pyfr.backends.cuda.provider import CUDAKernelProvider, get_grid_for_block
-from pyfr.backends.base import ComputeKernel
-from pyfr.nputil import npdtype_to_ctype
+from pyfr.backends.cuda.provider import (CUDAKernel, CUDAKernelProvider,
+                                         get_grid_for_block)
 
 
 class CUDABlasExtKernels(CUDAKernelProvider):
@@ -16,7 +10,8 @@ class CUDABlasExtKernels(CUDAKernelProvider):
             raise ValueError('Incompatible matrix types')
 
         nv = len(arr)
-        nrow, ncol, ldim, dtype = arr[0].traits
+        ixdtype = self.backend.ixdtype
+        nrow, ncol, ldim, fpdtype = arr[0].traits[1:]
         ncola, ncolb = arr[0].ioshape[1:]
 
         # Render the kernel template
@@ -26,74 +21,103 @@ class CUDABlasExtKernels(CUDAKernelProvider):
 
         # Build the kernel
         kern = self._build_kernel('axnpby', src,
-                                  [np.int32]*3 + [np.intp]*nv + [dtype]*nv)
+                                  [ixdtype]*2 + [np.uintp]*nv + [fpdtype]*nv)
 
         # Determine the grid/block
         block = (128, 1, 1)
         grid = get_grid_for_block(block, ncolb, nrow)
 
-        class AxnpbyKernel(ComputeKernel):
-            def run(self, queue, *consts):
-                args = list(arr) + list(consts)
+        # Set the parameters
+        params = kern.make_params(grid, block)
+        params.set_args(ncolb, ldim, *arr)
 
-                kern.prepared_async_call(grid, block, queue.cuda_stream_comp,
-                                         nrow, ncolb, ldim, *args)
+        class AxnpbyKernel(CUDAKernel):
+            def bind(self, *consts):
+                params.set_args(*consts, start=2 + nv)
 
-        return AxnpbyKernel()
+            def run(self, stream):
+                kern.exec_async(stream, params)
+
+        return AxnpbyKernel(mats=arr)
 
     def copy(self, dst, src):
+        cuda = self.backend.cuda
+
         if dst.traits != src.traits:
             raise ValueError('Incompatible matrix types')
 
-        class CopyKernel(ComputeKernel):
-            def run(self, queue):
-                cuda.memcpy_dtod_async(dst.data, src.data, dst.nbytes,
-                                       stream=queue.cuda_stream_comp)
+        class CopyKernel(CUDAKernel):
+            def add_to_graph(self, graph, deps):
+                return graph.graph.add_memcpy(dst, src, dst.nbytes, deps)
 
-        return CopyKernel()
+            def run(self, stream):
+                cuda.memcpy(dst, src, dst.nbytes, stream)
 
-    def errest(self, x, y, z, *, norm):
-        if x.traits != y.traits != z.traits:
+        return CopyKernel(mats=[dst, src])
+
+    def reduction(self, *rs, method, norm, dt_mat=None):
+        if any(r.traits != rs[0].traits for r in rs[1:]):
             raise ValueError('Incompatible matrix types')
 
-        nrow, ncol, ldim, dtype = x.traits
-        ncola, ncolb = x.ioshape[1:]
+        cuda = self.backend.cuda
+        ixdtype = self.backend.ixdtype
+        nrow, ncol, ldim, fpdtype = rs[0].traits[1:]
+        ncola, ncolb = rs[0].ioshape[1:]
 
         # Reduction block dimensions
-        block = (128, 1, 1)
+        block = (256, 1, 1)
 
         # Determine the grid size
-        grid = get_grid_for_block(block, ncolb)
+        grid = get_grid_for_block(block, ncolb, ncola)
 
-        # Empty result buffer on host with shape (nvars, nblocks)
-        err_host = cuda.pagelocked_empty((ncola, grid[0]), dtype, 'C')
+        # Empty result buffer on the device
+        reduced_dev = cuda.mem_alloc(ncola*grid[0]*rs[0].itemsize)
 
-        # Device memory allocation
-        err_dev = cuda.mem_alloc(err_host.nbytes)
+        # Empty result buffer on the host
+        reduced_host = cuda.pagelocked_empty((ncola, grid[0]), fpdtype)
+
+        tplargs = dict(norm=norm, method=method)
+
+        if method == 'resid':
+            tplargs['dt_type'] = 'matrix' if dt_mat else 'scalar'
 
         # Get the kernel template
-        src = self.backend.lookup.get_template('errest').render(
-            norm=norm, ncola=ncola, sharesz=block[0]
-        )
+        src = self.backend.lookup.get_template('reduction').render(**tplargs)
+
+        regs = list(rs) + [dt_mat] if dt_mat else rs
+
+        # Argument types for reduction kernel
+        if method == 'errest':
+            argt = [ixdtype]*3 + [np.uintp]*4 + [fpdtype]*2
+        elif method == 'resid' and dt_mat:
+            argt = [ixdtype]*3 + [np.uintp]*4 + [fpdtype]
+        else:
+            argt = [ixdtype]*3 + [np.uintp]*3 + [fpdtype]
 
         # Build the reduction kernel
-        rkern = self._build_kernel(
-            'errest', src, [np.int32]*3 + [np.intp]*4 + [dtype]*2
-        )
+        rkern = self._build_kernel('reduction', src, argt)
+
+        # Set the parameters
+        params = rkern.make_params(grid, block)
+        params.set_args(nrow, ncolb, ldim, reduced_dev, *regs)
+
+        # Runtime argument offset
+        facoff = argt.index(fpdtype)
 
         # Norm type
         reducer = np.max if norm == 'uniform' else np.sum
 
-        class ErrestKernel(ComputeKernel):
+        class ReductionKernel(CUDAKernel):
             @property
             def retval(self):
-                return reducer(err_host, axis=1)
+                return reducer(reduced_host, axis=1)
 
-            def run(self, queue, atol, rtol):
-                rkern.prepared_async_call(grid, block, queue.cuda_stream_comp,
-                                          nrow, ncolb, ldim, err_dev, x, y, z,
-                                          atol, rtol)
-                cuda.memcpy_dtoh_async(err_host, err_dev,
-                                       queue.cuda_stream_comp)
+            def bind(self, *facs):
+                params.set_args(*facs, start=facoff)
 
-        return ErrestKernel()
+            def run(self, stream):
+                rkern.exec_async(stream, params)
+                cuda.memcpy(reduced_host, reduced_dev, reduced_dev.nbytes,
+                            stream)
+
+        return ReductionKernel(mats=regs)

@@ -1,15 +1,13 @@
-# -*- coding: utf-8 -*-
-
 import numpy as np
-import pyopencl as cl
 
-from pyfr.backends.base import ComputeKernel
-from pyfr.backends.base.packing import BasePackingKernels
-from pyfr.backends.opencl.provider import OpenCLKernelProvider
+from pyfr.backends.opencl.provider import OpenCLKernel, OpenCLKernelProvider
 
 
-class OpenCLPackingKernels(OpenCLKernelProvider, BasePackingKernels):
+class OpenCLPackingKernels(OpenCLKernelProvider):
     def pack(self, mv):
+        cl = self.backend.cl
+        ixdtype = self.backend.ixdtype
+
         # An exchange view is simply a regular view plus an exchange matrix
         m, v = mv.xchgmat, mv.view
 
@@ -17,28 +15,25 @@ class OpenCLPackingKernels(OpenCLKernelProvider, BasePackingKernels):
         src = self.backend.lookup.get_template('pack').render()
 
         # Build
-        kern = self._build_kernel('pack_view', src, [np.int32]*3 + [np.intp]*4)
+        kern = self._build_kernel('pack_view', src, [ixdtype]*3 + [np.uintp]*4)
+        kern.set_dims((v.n,))
+        kern.set_args(v.n, v.nvrow, v.nvcol, v.basedata, v.mapping,
+                      v.rstrides or 0, m)
 
-        class PackXchgViewKernel(ComputeKernel):
-            def run(self, queue):
-                # Kernel arguments
-                args = [v.n, v.nvrow, v.nvcol, v.basedata, v.mapping,
-                        v.rstrides, m]
-                args = [getattr(arg, 'data', arg) for arg in args]
+        class PackXchgViewKernel(OpenCLKernel):
+            def run(self, queue, wait_for=None, ret_evt=False):
+                pevt = kern.exec_async(queue, wait_for, True)
+                return cl.memcpy(queue, m.hdata, m.data, m.nbytes,
+                                 False, [pevt], ret_evt)
 
-                # Pack
-                event = kern(queue.cl_queue_comp, (v.n,), None, *args)
-
-                # Copy the packed buffer to the host
-                cl.enqueue_copy(queue.cl_queue_copy, m.hdata, m.data,
-                                is_blocking=False, wait_for=[event])
-
-        return PackXchgViewKernel()
+        return PackXchgViewKernel(mats=[mv])
 
     def unpack(self, mv):
-        class UnpackXchgMatrixKernel(ComputeKernel):
-            def run(self, queue):
-                cl.enqueue_copy(queue.cl_queue_comp, mv.data, mv.hdata,
-                                is_blocking=False)
+        cl = self.backend.cl
 
-        return UnpackXchgMatrixKernel()
+        class UnpackXchgMatrixKernel(OpenCLKernel):
+            def run(self, queue, wait_for=None, ret_evt=False):
+                return cl.memcpy(queue, mv.data, mv.hdata, mv.nbytes,
+                                 False, wait_for, ret_evt)
+
+        return UnpackXchgMatrixKernel(mats=[mv])

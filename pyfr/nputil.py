@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 import ctypes as ct
 import functools as ft
 import itertools as it
@@ -21,10 +19,13 @@ def block_diag(arrs):
     return out
 
 
-def clean(origfn=None, tol=1e-10):
+def clean(origfn=None, tol=1e-10, ckwarg='clean'):
     def cleanfn(fn):
         @ft.wraps(fn)
         def newfn(*args, **kwargs):
+            if not kwargs.pop(ckwarg, True):
+                return fn(*args, **kwargs)
+
             arr = fn(*args, **kwargs).copy()
 
             # Flush small elements to zero
@@ -37,7 +38,8 @@ def clean(origfn=None, tol=1e-10):
 
                 i, ix = 0, amix[0]
                 for j, jx in enumerate(amix[1:], start=1):
-                    if amfl[jx] - amfl[ix] >= tol:
+                    if not np.isclose(amfl[jx], amfl[ix], rtol=tol,
+                                      atol=0.1*tol):
                         if j - i > 1:
                             amfl[amix[i:j]] = np.median(amfl[amix[i:j]])
                         i, ix = j, jx
@@ -54,14 +56,47 @@ def clean(origfn=None, tol=1e-10):
     return cleanfn(origfn) if origfn else cleanfn
 
 
+def morton_encode(ipts, imax, dtype=np.uint64):
+    # Allocate the codes
+    codes = np.zeros(len(ipts), dtype=dtype)
+
+    # Determine how many bits to use for each input dimension
+    ndims = ipts.shape[1]
+    obits = 8*codes.dtype.itemsize
+    ibits = obits // ndims
+    ishift = np.array([max(int(p).bit_length() - ibits, 0) for p in imax],
+                      dtype=dtype)
+
+    # Compute the masks and shifts
+    ops = [[(1 << j, (ndims - 1)*j + i) for j in range(ibits)]
+           for i in range(ndims)]
+
+    # Cache-block the arrays
+    n = max(1, len(codes) // 16384)
+    bipts = np.array_split(ipts, n)
+    bcodes = np.array_split(codes, n)
+
+    # Loop over each block
+    for ipt, code in zip(bipts, bcodes):
+        # Loop over each dimension
+        for p, pops in zip((ipt >> ishift).T, ops):
+            # Extract and interleave the bits
+            for mask, shift in pops:
+                code |= (p & mask) << shift
+
+    return codes
+
+
 _npeval_syms = {
-    '__builtins__': None,
+    '__builtins__': {},
     'exp': np.exp, 'log': np.log,
     'sin': np.sin, 'asin': np.arcsin,
     'cos': np.cos, 'acos': np.arccos,
     'tan': np.tan, 'atan': np.arctan, 'atan2': np.arctan2,
     'abs': np.abs, 'pow': np.power, 'sqrt': np.sqrt,
-    'tanh': np.tanh, 'pi': np.pi}
+    'tanh': np.tanh, 'pi': np.pi,
+    'max': np.maximum, 'min': np.minimum
+}
 
 
 def npeval(expr, locals):
@@ -75,7 +110,7 @@ def npeval(expr, locals):
 
     # Disallow access to object attributes
     objs = '|'.join(it.chain(_npeval_syms, locals))
-    if re.search(r'(%s|\))\s*\.' % objs, expr):
+    if re.search(rf'({objs}|\))\s*\.', expr):
         raise ValueError('Invalid expression')
 
     return eval(expr, _npeval_syms, locals)
@@ -100,10 +135,16 @@ def fuzzysort(arr, idx, dim=0, tol=1e-6):
     return srtdidx
 
 
+def iter_struct(arr, n=1000, axis=0):
+    for c in np.array_split(arr, -(arr.shape[axis] // -n) or 1, axis=axis):
+        yield from c.tolist()
+
+
 _ctype_map = {
     np.int32: 'int', np.uint32: 'unsigned int',
-    np.int64: 'long long', np.uint64: 'unsigned long long',
-    np.float32: 'float', np.float64: 'double'}
+    np.int64: 'int64_t', np.uint64: 'uint64_t',
+    np.float32: 'float', np.float64: 'double'
+}
 
 
 def npdtype_to_ctype(dtype):
@@ -113,7 +154,8 @@ def npdtype_to_ctype(dtype):
 _ctypestype_map = {
     np.int32: ct.c_int32, np.uint32: ct.c_uint32,
     np.int64: ct.c_int64, np.uint64: ct.c_uint64,
-    np.float32: ct.c_float, np.float64: ct.c_double}
+    np.float32: ct.c_float, np.float64: ct.c_double
+}
 
 
 def npdtype_to_ctypestype(dtype):

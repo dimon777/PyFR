@@ -1,17 +1,19 @@
-# -*- coding: utf-8 -*-
 <%inherit file='base'/>
 <%namespace module='pyfr.backends.base.makoutil' name='pyfr'/>
 
 #include <string.h>
 
-void
-par_memcpy(char *dst, const char *src, int n)
+struct kargs
 {
-    #pragma omp parallel
-    {
-        int begin, end;
-        loop_sched_1d(n, 1, &begin, &end);
+    char *dst;
+    const char *src;
+    ixdtype_t dbbytes, sbbytes, bnbytes, nblocks;
+};
 
-        memcpy(dst + begin, src + begin, end - begin);
-    }
+void par_memcpy(const struct kargs *restrict args)
+{
+    #pragma omp parallel for ${schedule}
+    for (ixdtype_t ib = 0; ib < args->nblocks; ib++)
+        memcpy(args->dst + ((size_t) args->dbbytes)*ib,
+               args->src + ((size_t) args->sbbytes)*ib, args->bnbytes);
 }

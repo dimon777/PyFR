@@ -1,18 +1,15 @@
-# -*- coding: utf-8 -*-
-
 from pyfr.mpiutil import get_comm_rank_root
-from pyfr.plugins.base import BasePlugin, init_csv
+from pyfr.plugins.base import BaseSolnPlugin, init_csv
 
 
-class DtStatsPlugin(BasePlugin):
+class DtStatsPlugin(BaseSolnPlugin):
     name = 'dtstats'
     systems = ['*']
     formulations = ['std']
+    dimensions = [2, 3]
 
     def __init__(self, intg, cfgsect, prefix):
         super().__init__(intg, cfgsect, prefix)
-
-        self.flushsteps = self.cfg.getint(self.cfgsect, 'flushsteps', 500)
 
         self.count = 0
         self.stats = []
@@ -23,9 +20,10 @@ class DtStatsPlugin(BasePlugin):
 
         # The root rank needs to open the output file
         if rank == root:
-            self.outf = init_csv(self.cfg, cfgsect, 'n,t,dt,action,error')
+            header = 'n,t,dt,action,error'
+            self.csv = init_csv(self.cfg, cfgsect, header, nflush=500)
         else:
-            self.outf = None
+            self.csv = None
 
     def __call__(self, intg):
         # Process the sequence of rejected/accepted steps
@@ -37,13 +35,9 @@ class DtStatsPlugin(BasePlugin):
         self.tprev = intg.tcurr
 
         # If we're the root rank then output
-        if self.outf:
+        if self.csv:
             for s in self.stats:
-                print(','.join(str(c) for c in s), file=self.outf)
-
-            # Periodically flush to disk
-            if intg.nacptsteps % self.flushsteps == 0:
-                self.outf.flush()
+                self.csv(*s)
 
         # Reset the stats
         self.stats = []

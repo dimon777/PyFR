@@ -1,69 +1,42 @@
-# -*- coding: utf-8 -*-
+from math import prod
 
-from pyfr.backends.base.generator import BaseKernelGenerator
+from pyfr.backends.base.generator import BaseGPUKernelGenerator
 
 
-class CUDAKernelGenerator(BaseKernelGenerator):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        # Specialise
-        if self.ndim == 1:
-            self._ix = 'int _x = blockIdx.x*blockDim.x + threadIdx.x;'
-            self._limits = 'if (_x < _nx)'
-        else:
-            self._ix = ('int _x = blockIdx.x*blockDim.x + threadIdx.x;'
-                        'int _y = blockIdx.y*blockDim.y + threadIdx.y;')
-            self._limits = 'if (_x < _nx && _y < _ny)'
-
-    def render(self):
-        # Kernel spec
-        spec = self._render_spec()
-
-        # Iteration indicies and limits
-        ix, limits = self._ix, self._limits
-
-        # Combine
-        return '''{spec}
-               {{
-                   {ix}
-                   #define X_IDX (_x)
-                   #define X_IDX_AOSOA(v, nv) SOA_IX(X_IDX, v, nv)
-                   {limits}
-                   {{
-                       {body}
-                   }}
-                   #undef X_IDX
-                   #undef X_IDX_AOSOA
-               }}'''.format(spec=spec, ix=ix, limits=limits, body=self.body)
+class CUDAKernelGenerator(BaseGPUKernelGenerator):
+    _lid = ('threadIdx.x', 'threadIdx.y')
+    _gid = 'ixdtype_t(blockIdx.x)*blockDim.x + threadIdx.x'
+    _shared_prfx = '__shared__'
+    _shared_sync = '__syncthreads()'
 
     def _render_spec(self):
+        res = '__restrict__'
+
         # We first need the argument list; starting with the dimensions
-        kargs = ['int ' + d for d in self._dims]
+        kargs = [f'ixdtype_t {d}' for d in self._dims]
 
         # Now add any scalar arguments
-        kargs.extend('{0.dtype} {0.name}'.format(sa) for sa in self.scalargs)
+        kargs.extend(f'{sa.dtype} {sa.name}' for sa in self.scalargs)
 
         # Finally, add the vector arguments
         for va in self.vectargs:
+            if va.intent == 'in':
+                kargs.append(f'const {va.dtype}* {res} {va.name}_v')
+            else:
+                kargs.append(f'{va.dtype}* {res} {va.name}_v')
+
             # Views
             if va.isview:
-                kargs.append('{0.dtype}* __restrict__ {0.name}_v'.format(va))
-                kargs.append('const int* __restrict__ {0.name}_vix'
-                             .format(va))
+                kargs.append(f'const ixdtype_t* {res} {va.name}_vix')
 
                 if va.ncdim == 2:
-                    kargs.append('const int* __restrict__ {0.name}_vrstri'
-                                 .format(va))
+                    kargs.append(f'const ixdtype_t* {res} {va.name}_vrstri')
             # Arrays
-            else:
-                # Intent in arguments should be marked constant
-                const = 'const' if va.intent == 'in' else ''
+            elif self.needs_ldim(va):
+                kargs.append(f'ixdtype_t ld{va.name}')
 
-                kargs.append('{0} {1.dtype}* __restrict__ {1.name}_v'
-                             .format(const, va).strip())
+        # Determine the launch bounds for the kernel
+        nthrds = prod(self.block1d if self.ndim == 1 else self.block2d)
+        kattrs = f'__global__ __launch_bounds__({nthrds})'
 
-                if self.needs_ldim(va):
-                    kargs.append('int ld{0.name}'.format(va))
-
-        return '__global__ void {0}({1})'.format(self.name, ', '.join(kargs))
+        return '{0} void {1}({2})'.format(kattrs, self.name, ', '.join(kargs))

@@ -1,102 +1,57 @@
-# -*- coding: utf-8 -*-
-
-from ctypes import cast, c_int, c_double, c_float, c_void_p
+from ctypes import byref, cast, c_int, c_double, c_float, c_ulonglong, c_void_p
+from weakref import finalize
 
 import numpy as np
 
-from pyfr.backends.base import ComputeKernel, NotSuitableError
-from pyfr.backends.openmp.provider import OpenMPKernelProvider
-from pyfr.ctypesutil import load_library
+from pyfr.backends.base import NotSuitableError
+from pyfr.backends.openmp.provider import OpenMPKernel, OpenMPKernelProvider
+from pyfr.ctypesutil import LibWrapper
 
 
-class XSMMWrappers(object):
-    def __init__(self):
-        lib = load_library('xsmm')
+class XSMMWrappers(LibWrapper):
+    _libname = 'xsmm'
 
-        # libxsmm_init
-        self.libxsmm_init = lib.libxsmm_init
-        self.libxsmm_init.argtypes = []
-        self.libxsmm_init.restype = None
-
-        # libxsmm_finalize
-        self.libxsmm_finalize = lib.libxsmm_finalize
-        self.libxsmm_finalize.argtypes = []
-        self.libxsmm_finalize.restype = None
-
-        # libxsmm_dfsspmdm_create
-        self.libxsmm_dfsspmdm_create = lib.libxsmm_dfsspmdm_create
-        self.libxsmm_dfsspmdm_create.argtypes = [
-            c_int, c_int, c_int, c_int, c_int, c_int,
-            c_double, c_double, c_void_p
-        ]
-        self.libxsmm_dfsspmdm_create.restype = c_void_p
-
-        # libxsmm_sfsspmdm_create
-        self.libxsmm_sfsspmdm_create = lib.libxsmm_sfsspmdm_create
-        self.libxsmm_sfsspmdm_create.argtypes = [
-            c_int, c_int, c_int, c_int, c_int, c_int,
-            c_float, c_float, c_void_p
-        ]
-        self.libxsmm_sfsspmdm_create.restype = c_void_p
-
-        # libxsmm_dfsspmdm_execute
-        self.libxsmm_dfsspmdm_execute = lib.libxsmm_dfsspmdm_execute
-        self.libxsmm_dfsspmdm_execute.argtypes = [
-            c_void_p, c_void_p, c_void_p
-        ]
-        self.libxsmm_dfsspmdm_execute.restype = None
-
-        # libxsmm_sfsspmdm_execute
-        self.libxsmm_sfsspmdm_execute = lib.libxsmm_sfsspmdm_execute
-        self.libxsmm_sfsspmdm_execute.argtypes = [
-            c_void_p, c_void_p, c_void_p
-        ]
-        self.libxsmm_sfsspmdm_execute.restype = None
-
-        # libxsmm_dfsspmdm_destroy
-        self.libxsmm_dfsspmdm_destroy = lib.libxsmm_dfsspmdm_destroy
-        self.libxsmm_dfsspmdm_destroy.argtypes = [c_void_p]
-        self.libxsmm_dfsspmdm_destroy.restype = None
-
-        # libxsmm_sfsspmdm_destroy
-        self.libxsmm_sfsspmdm_destroy = lib.libxsmm_sfsspmdm_destroy
-        self.libxsmm_sfsspmdm_destroy.argtypes = [c_void_p]
-        self.libxsmm_sfsspmdm_destroy.restype = None
+    # Functions
+    _functions = [
+        (None, 'libxsmm_init'),
+        (None, 'libxsmm_finalize'),
+        (c_void_p, 'libxsmm_fsspmdm_create', c_int, c_int, c_int, c_int, c_int,
+         c_int, c_int, c_void_p, c_void_p, c_void_p, c_int, c_void_p),
+        (None, 'libxsmm_fsspmdm_execute', c_void_p, c_void_p, c_void_p),
+        (None, 'libxsmm_fsspmdm_destroy', c_void_p),
+        (c_ulonglong, 'libxsmm_timer_tick')
+    ]
 
 
 class OpenMPXSMMKernels(OpenMPKernelProvider):
     def __init__(self, backend):
         super().__init__(backend)
 
-        self.nblock = backend.cfg.getint('backend-openmp', 'libxsmm-block-sz',
-                                         48)
-        self.max_sz = backend.cfg.getint('backend-openmp', 'libxsmm-max-sz',
-                                         125**2)
-
-        # Ensure the block size is divisible by 16
-        if self.nblock % 16 != 0:
-            raise ValueError('libxsmm-block-sz must be a multiple of 16')
-
-        # Active kernel list
-        self._kerns = []
+        # Kernel cache
+        self._kerns = {}
 
         # Load and wrap libxsmm
-        self._wrappers = XSMMWrappers()
+        self._wrappers = w = XSMMWrappers()
+
+        self._exec_ptr = cast(w.libxsmm_fsspmdm_execute, c_void_p).value
+        self._nmod = 8 if backend.fpdtype == np.float64 else 16
 
         # Init
-        self._wrappers.libxsmm_init()
+        w.libxsmm_init()
+
+    def _destroy_kern(self, k):
+        blkptr, blkptr_nt = self._kerns.pop(k)
+
+        self._wrappers.libxsmm_fsspmdm_destroy(blkptr)
+
+        if blkptr_nt != blkptr:
+            self._wrappers.libxsmm_fsspmdm_destroy(blkptr_nt)
 
     def __del__(self):
         if hasattr(self, '_wrappers'):
-            for kern, destroy in self._kerns:
-                destroy(kern)
-
             self._wrappers.libxsmm_finalize()
 
     def mul(self, a, b, out, alpha=1.0, beta=0.0):
-        w = self._wrappers
-        nblock = self.nblock
-
         # Ensure the matrices are compatible
         if a.nrow != out.nrow or a.ncol != b.nrow or b.ncol != out.ncol:
             raise ValueError('Incompatible matrices for out = a*b')
@@ -105,67 +60,76 @@ class OpenMPXSMMKernels(OpenMPKernelProvider):
         if 'const' not in a.tags:
             raise NotSuitableError('libxsmm requires a constant a matrix')
 
-        # Check n is divisible by 16
-        if b.ncol % 16 != 0:
-            raise NotSuitableError('libxsmm requires n % 16 = 0')
+        # Check n is suitable
+        if b.leaddim % self._nmod != 0:
+            raise NotSuitableError(f'libxsmm requires n % {self._nmod} = 0')
 
         # Check that beta is zero or one
         if beta != 0.0 and beta != 1.0:
-            raise NotSuitableError('libxssm requires β = 0 or β = 1')
+            raise NotSuitableError('libxsmm requires β = 0 or β = 1')
 
-        # Check the matrix is of a reasonable size
-        if a.ncol*a.nrow > self.max_sz:
-            raise NotSuitableError('Matrix too large for libxsmm')
+        # Index type
+        ixdtype = self.backend.ixdtype
 
         # Dimensions
-        m, n, k = a.nrow, b.ncol, a.ncol
-        lda, ldb, ldc = a.leaddim, b.leaddim, out.leaddim
+        ldb, ldc = b.leaddim, out.leaddim
 
-        # Precision specific functions
-        if a.dtype == np.float64:
-            create = w.libxsmm_dfsspmdm_create
-            execute = w.libxsmm_dfsspmdm_execute
-            destroy = w.libxsmm_dfsspmdm_destroy
+        # Cache key
+        ckey = (a.mid, alpha, beta, b.nblocks, ldb, ldc)
 
-            alpha_ct, beta_ct = c_double(alpha), c_double(beta)
-        else:
-            create = w.libxsmm_sfsspmdm_create
-            execute = w.libxsmm_sfsspmdm_execute
-            destroy = w.libxsmm_sfsspmdm_destroy
+        # Check the JIT kernel cache
+        try:
+            blkptr, blkptr_nt = self._kerns[ckey]
+        except KeyError:
+            c_is_nt = (beta == 0 and
+                       out.nbytes >= 32*1024**2 and
+                       self.backend.alignb >= 64)
 
-            alpha_ct, beta_ct = c_float(alpha), c_float(beta)
+            a_np = np.ascontiguousarray(a.get())
+            m, k = a_np.shape
 
-        # Get the A matrix
-        a_np = a.get()
+            if self.backend.fpdtype == np.float64:
+                xsmm_dtype = 0
+                alpha, beta = c_double(alpha), c_double(beta)
+            else:
+                xsmm_dtype = 1
+                alpha, beta = c_float(alpha), c_float(beta)
 
-        # JIT and register an nblock size kernel for this A matrix
-        blockk_ptr = create(m, nblock, k, lda, ldb, ldc, alpha_ct,
-                            beta_ct, a_np.ctypes.data)
-        self._kerns.append((blockk_ptr, destroy))
+            timer_tick = cast(self._wrappers.libxsmm_timer_tick, c_void_p)
 
-        # If necessary, also JIT and register a clean-up kernel for A
-        if n % nblock != 0:
-            cleank_ptr = create(m, n % nblock, k, lda, ldb, ldc, alpha_ct,
-                                beta_ct, a_np.ctypes.data)
-            self._kerns.append((cleank_ptr, destroy))
-        else:
-            cleank_ptr = 0
+            # Create a block leaddim size kernel for this matrix
+            blkptr = self._wrappers.libxsmm_fsspmdm_create(
+                xsmm_dtype, m, b.leaddim, k, k, ldb, ldc, byref(alpha),
+                byref(beta), a_np.ctypes.data, False, timer_tick
+            )
+            if not blkptr:
+                raise NotSuitableError('libxsmm unable to JIT a kernel')
 
-        # Obtain a pointer to the execute function
-        exec_ptr = cast(execute, c_void_p).value
+            # Also consider creating a non-temporal kernel
+            if c_is_nt:
+                blkptr_nt = self._wrappers.libxsmm_fsspmdm_create(
+                    xsmm_dtype, m, b.leaddim, k, k, ldb, ldc, byref(alpha),
+                    byref(beta), a_np.ctypes.data, True, timer_tick
+                )
+                if not blkptr_nt:
+                    raise NotSuitableError('libxsmm unable to JIT a kernel')
+            else:
+                blkptr_nt = blkptr
+
+            # Update the cache
+            self._kerns[ckey] = blkptr, blkptr_nt
+            finalize(a, self._destroy_kern, ckey)
 
         # Render our parallel wrapper kernel
-        src = self.backend.lookup.get_template('par-xsmm').render()
-
-        # Argument types for par_xsmm
-        argt = [np.intp, np.intp, np.intp, np.int32, np.int32, np.intp,
-                np.intp]
+        src = self.backend.lookup.get_template('batch-gemm').render()
 
         # Build
-        par_xsmm = self._build_kernel('par_xsmm', src, argt)
+        batch_gemm = self._build_kernel(
+            'batch_gemm', src, [np.uintp]*3 + [np.uintp, ixdtype]*2,
+            ['exec', 'blkptr', 'blkptr_nt', 'b', 'bsz', 'out', 'outsz']
+        )
+        batch_gemm.set_args(self._exec_ptr, blkptr, blkptr_nt, b, b.blocksz,
+                            out, out.blocksz)
+        batch_gemm.set_nblocks(b.nblocks)
 
-        class MulKernel(ComputeKernel):
-            def run(iself, queue):
-                par_xsmm(exec_ptr, blockk_ptr, cleank_ptr, n, nblock, b, out)
-
-        return MulKernel()
+        return OpenMPKernel(mats=[a, b, out], misc=[self], kernel=batch_gemm)

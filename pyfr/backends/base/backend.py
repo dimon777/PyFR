@@ -1,7 +1,5 @@
-# -*- coding: utf-8 -*-
-
 from collections import defaultdict
-from functools import wraps
+from functools import cached_property, wraps
 from itertools import count
 import math
 from weakref import WeakKeyDictionary, WeakValueDictionary
@@ -10,21 +8,22 @@ import numpy as np
 
 from pyfr.backends.base.kernels import NotSuitableError
 from pyfr.template import DottedTemplateLookup
-from pyfr.util import lazyprop
 
 
 def recordmat(fn):
     @wraps(fn)
     def newfn(self, *args, **kwargs):
         m = fn(self, *args, **kwargs)
-        m.mid = next(self._mat_counter)
-        self.mats[m.mid] = m
+
+        if not hasattr(m, 'mid'):
+            m.mid = next(self._mat_counter)
+            self.mats[m.mid] = m
 
         return m
     return newfn
 
 
-class BaseBackend(object):
+class BaseBackend:
     name = None
 
     def __init__(self, cfg):
@@ -38,6 +37,21 @@ class BaseBackend(object):
 
         # Convert to a NumPy data type
         self.fpdtype = np.dtype(prec).type
+        self.fpdtype_eps = np.finfo(self.fpdtype).eps
+        self.fpdtype_max = np.finfo(self.fpdtype).max
+
+        # Memory model
+        match cfg.get('backend', 'memory-model', 'normal'):
+            case 'normal':
+                self.ixdtype = np.int32
+            case 'large':
+                self.ixdtype = np.int64
+            case _:
+                raise ValueError('Backend memory model must be either normal '
+                                 'or large')
+
+        # Autotuning improvement factor
+        self.autotune_ifac = cfg.getfloat('backend', 'autotune-ifac', 0.95)
 
         # Allocated matrices
         self.mats = WeakValueDictionary()
@@ -51,11 +65,14 @@ class BaseBackend(object):
         # Mapping from backend objects to memory extents
         self._obj_extents = WeakKeyDictionary()
 
-    @lazyprop
+    @cached_property
     def lookup(self):
-        pkg = 'pyfr.backends.{0}.kernels'.format(self.name)
-        dfltargs = dict(alignb=self.alignb, fpdtype=self.fpdtype,
-                        soasz=self.soasz, math=math)
+        pkg = f'pyfr.backends.{self.name}.kernels'
+        dfltargs = {
+            'fpdtype': self.fpdtype, 'ixdtype': self.ixdtype,
+            'fpdtype_max': self.fpdtype_max, 'csubsz': self.csubsz,
+            'soasz': self.soasz, 'math': math
+        }
 
         return DottedTemplateLookup(pkg, dfltargs)
 
@@ -63,7 +80,7 @@ class BaseBackend(object):
         # If no extent has been specified then autocommit
         if extent is None:
             # Perform the allocation
-            data = self._malloc_impl(obj.nbytes)
+            data = self._malloc_checked(obj.nbytes)
 
             # Fire the callback
             obj.onalloc(data, 0)
@@ -74,8 +91,8 @@ class BaseBackend(object):
         else:
             # Check that the extent has not already been committed
             if extent in self._comm_extents:
-                raise ValueError('Extent "{}" has already been allocated'
-                                 .format(extent))
+                raise ValueError(f'Extent "{extent}" has already been '
+                                 'allocated')
 
             # Append
             self._pend_extents[extent].append(obj)
@@ -98,7 +115,7 @@ class BaseBackend(object):
             sz = sum(obj.nbytes - (obj.nbytes % -self.alignb) for obj in reqs)
 
             # Perform the allocation
-            data = self._malloc_impl(sz)
+            data = self._malloc_checked(sz)
 
             offset = 0
             for obj in reqs:
@@ -117,57 +134,92 @@ class BaseBackend(object):
         self._pend_aliases.clear()
         self._pend_extents.clear()
 
+    def _malloc_checked(self, nbytes):
+        if self.ixdtype == np.int32 and nbytes > 4*2**31 - 1:
+            raise RuntimeError('Allocation too large for normal backend '
+                               'memory-model')
+
+        return self._malloc_impl(nbytes)
+
     def _malloc_impl(self, nbytes):
         pass
 
     @recordmat
-    def const_matrix(self, initval, extent=None, tags=set()):
-        return self.const_matrix_cls(self, initval, extent, tags)
+    def const_matrix(self, initval, dtype=None, tags=set()):
+        dtype = dtype or self.fpdtype
+
+        # See if we have previously allocated an identical matrix
+        for m in self.mats.values():
+            if (isinstance(m, self.const_matrix_cls) and
+                m.dtype == dtype and m.ioshape == initval.shape and
+                tags.issubset(m.tags) and (m.get() == initval).all()):
+                return m
+
+        return self.const_matrix_cls(self, dtype, initval, tags)
 
     @recordmat
     def matrix(self, ioshape, initval=None, extent=None, aliases=None,
-               tags=set()):
-        return self.matrix_cls(self, ioshape, initval, extent, aliases, tags)
+               tags=set(), dtype=None):
+        dtype = dtype or self.fpdtype
+        return self.matrix_cls(self, dtype, ioshape, initval, extent, aliases,
+                               tags)
 
     @recordmat
     def matrix_slice(self, mat, ra, rb, ca, cb):
         return self.matrix_slice_cls(self, mat, ra, rb, ca, cb)
 
-    def matrix_bank(self, mats, initbank=0, tags=set()):
-        return self.matrix_bank_cls(self, mats, initbank, tags)
-
     @recordmat
     def xchg_matrix(self, ioshape, initval=None, extent=None, aliases=None,
                     tags=set()):
-        return self.xchg_matrix_cls(self, ioshape, initval, extent, aliases,
-                                    tags)
+        return self.xchg_matrix_cls(self, self.fpdtype, ioshape, initval,
+                                    extent, aliases, tags)
 
     def xchg_matrix_for_view(self, view, tags=set()):
         return self.xchg_matrix((view.nvrow, view.nvcol*view.n), tags=tags)
 
-    def view(self, matmap, rmap, cmap, rstridemap=None, vshape=tuple(),
-             tags=set()):
+    def view(self, matmap, rmap, cmap, rstridemap=None, vshape=(), tags=set()):
         return self.view_cls(self, matmap, rmap, cmap, rstridemap, vshape,
                              tags)
 
-    def xchg_view(self, matmap, rmap, cmap, rstridemap=None, vshape=tuple(),
+    def xchg_view(self, matmap, rmap, cmap, rstridemap=None, vshape=(),
                   tags=set()):
         return self.xchg_view_cls(self, matmap, rmap, cmap, rstridemap,
                                   vshape, tags)
 
     def kernel(self, name, *args, **kwargs):
+        best_kern = None
+
+        # Loop through each kernel provider instance
         for prov in self._providers:
-            kern = getattr(prov, name, None)
-            if kern:
+            # See if it can potentially provide the requested kernel
+            kern_meth = getattr(prov, name, None)
+            if kern_meth:
+                ifac = self.autotune_ifac
+
                 try:
-                    return kern(*args, **kwargs)
+                    # Ask the provider for the kernel
+                    kern = kern_meth(*args, **kwargs)
                 except NotSuitableError:
-                    pass
-        else:
-            raise KeyError("'{}' has no providers".format(name))
+                    continue
 
-    def queue(self):
-        return self.queue_cls(self)
+                # Evaluate this kernel compared to the best seen so far
+                if best_kern is None or kern.dt < ifac*best_kern.dt:
+                    best_kern = kern
 
-    def runall(self, sequence):
-        self.queue_cls.runall(sequence)
+                    # If there is no benchmark data then short circut
+                    if np.isnan(best_kern.dt):
+                        return best_kern
+
+        if best_kern is None:
+            raise KeyError(f'Kernel "{name}" has no providers')
+
+        return best_kern
+
+    def ordered_meta_kernel(self, kerns):
+        return self.ordered_meta_kernel_cls(kerns)
+
+    def unordered_meta_kernel(self, kerns, splits=None):
+        return self.unordered_meta_kernel_cls(kerns, splits)
+
+    def graph(self):
+        return self.graph_cls(self)

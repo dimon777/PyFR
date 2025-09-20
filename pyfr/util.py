@@ -1,61 +1,17 @@
-# -*- coding: utf-8 -*-
-
-from contextlib import contextmanager
 from ctypes import c_void_p
-import functools as ft
 import hashlib
 import itertools as it
 import os
 import pickle
+import re
 import shutil
 
 from pyfr.ctypesutil import get_libc_function
 
 
-class memoize(object):
-    def __init__(self, func):
-        self.func = func
-
-    def __get__(self, instance, owner):
-        return self.func if instance is None else ft.partial(self, instance)
-
-    def __call__(self, *args, **kwargs):
-        instance = args[0]
-
-        try:
-            cache = instance._memoize_cache
-        except AttributeError:
-            cache = instance._memoize_cache = {}
-
-        key = (self.func, pickle.dumps(args[1:]), pickle.dumps(kwargs))
-
-        try:
-            res = cache[key]
-        except KeyError:
-            res = cache[key] = self.func(*args, **kwargs)
-
-        return res
-
-
-class proxylist(list):
-    def __getattr__(self, attr):
-        return proxylist(getattr(x, attr) for x in self)
-
-    def __setattr__(self, attr, val):
-        for x in self:
-            setattr(x, attr, val)
-
-    def __delattr__(self, attr):
-        for x in self:
-            delattr(x, attr)
-
-    def __call__(self, *args, **kwargs):
-        return proxylist(x(*args, **kwargs) for x in self)
-
-
-class silence(object):
+class silence:
     def __init__(self, stdout=os.devnull, stderr=os.devnull):
-        self.outfiles = stdout, stderr
+        self.outfiles = (stdout, stderr)
         self.combine = (stdout == stderr)
 
         # Acquire a handle to fflush from libc
@@ -107,42 +63,27 @@ class silence(object):
         os.close(self.saved_fds[1])
 
 
-@contextmanager
-def setenv(**kwargs):
-    _env = os.environ.copy()
-    os.environ.update(kwargs)
+def merge_intervals(ivals, tol=1e-5):
+    ivals = sorted(ivals, reverse=True)
+    mivals = [ivals.pop()]
 
-    try:
-        yield
-    finally:
-        os.environ.clear()
-        os.environ.update(_env)
+    while ivals:
+        lstart, lend = mivals[-1]
+        cstart, cend = ivals.pop()
 
+        if cstart < lend:
+            raise ValueError('Overlapping range')
 
-@contextmanager
-def chdir(dirname):
-    cdir = os.getcwd()
+        if abs(cstart - lend) < tol:
+            mivals[-1] = (lstart, cend)
+        else:
+            mivals.append((cstart, cend))
 
-    try:
-        if dirname:
-            os.chdir(dirname)
-        yield
-    finally:
-        os.chdir(cdir)
+    return mivals
 
 
-class lazyprop(object):
-    def __init__(self, fn):
-        self.fn = fn
-
-    def __get__(self, instance, owner):
-        if instance is None:
-            return None
-
-        value = self.fn(instance)
-        setattr(instance, self.fn.__name__, value)
-
-        return value
+def first(v):
+    return next(iter(v))
 
 
 def subclasses(cls, just_leaf=False):
@@ -160,9 +101,8 @@ def subclass_where(cls, **kwargs):
         else:
             return s
 
-    attrs = ', '.join('{0} = {1}'.format(k, v) for k, v in kwargs.items())
-    raise KeyError('No subclasses of {0} with attrs == ({1})'
-                   .format(cls.__name__, attrs))
+    attrs = ', '.join(f'{k} = {v}' for k, v in kwargs.items())
+    raise KeyError(f'No subclasses of {cls.__name__} with attrs == ({attrs})')
 
 
 def ndrange(*args):
@@ -170,7 +110,19 @@ def ndrange(*args):
 
 
 def digest(*args, hash='sha256'):
-    return getattr(hashlib, hash)(pickle.dumps(args)).hexdigest()
+    class Hasher:
+        def __init__(self, hash):
+            self.h = getattr(hashlib, hash)()
+
+        def write(self, b):
+            self.h.update(b)
+
+        def __str__(self):
+            return self.h.hexdigest()
+
+    h = Hasher(hash)
+    pickle.dump(args, h)
+    return str(h)
 
 
 def rm(path):
@@ -186,10 +138,34 @@ def mv(src, dst):
 
 def match_paired_paren(delim, n=5):
     open, close = delim
-    ocset = '[^{1}{0}]'.format(open, close)
+    ocset = f'[^{close}{open}]'
 
-    lft = r'{0}*?(?:\{1}'.format(ocset, open)
-    mid = r'{0}*?'.format(ocset)
-    rgt = r'\{1}{0}*?)*?'.format(ocset, close)
+    lft = rf'{ocset}*?(?:\{open}'
+    mid = rf'{ocset}*?'
+    rgt = rf'\{close}{ocset}*?)*?'
 
     return lft*n + mid + rgt*n
+
+
+def file_path_gen(basedir, basename, restore=False):
+    def g():
+        ns = 0
+
+        # See if the basename appears to depend on {n}
+        if restore and re.search('{n[^}]*}', basename):
+            # Quote and substitute
+            bn = re.escape(basename)
+            bn = re.sub(r'\\{n[^}]*\\}', r'(\\s*\\d+\\s*)', bn)
+            bn = re.sub(r'\\{t[^}]*\\}', r'(?:.*?)', bn) + '$'
+            for f in os.listdir(basedir):
+                if (m := re.match(bn, f)):
+                    ns = max(ns, int(m[1]) + 1)
+
+        t = yield
+
+        for n in it.count(ns):
+            t = yield os.path.join(basedir, basename.format(t=t, n=n))
+
+    gen = g()
+    next(gen)
+    return gen

@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
-
-from collections import Iterable
+from collections.abc import Iterable
 import itertools as it
 import re
 
 from mako.runtime import supports_caller, capture
+import numpy as np
 
 import pyfr.nputil as nputil
 import pyfr.util as util
@@ -22,8 +21,8 @@ def npdtype_to_ctype(context, dtype):
     return nputil.npdtype_to_ctype(dtype)
 
 
-def dot(context, a_, b_=None, **kwargs):
-    ix, nd = next(iter(kwargs.items()))
+def dot(context, a_, b_=None, /, **kwargs):
+    ix, nd = util.first(kwargs.items())
     ab = '({})*({})'.format(a_, b_ or a_)
 
     # Allow for flexible range arguments
@@ -32,13 +31,29 @@ def dot(context, a_, b_=None, **kwargs):
     return '(' + ' + '.join(ab.format(**{ix: i}) for i in range(*nd)) + ')'
 
 
-def array(context, ex_, **kwargs):
-    ix, ni = next(iter(kwargs.items()))
+def array(context, expr_, vals_={}, /, **kwargs):
+    ix = util.first(kwargs)
+    ni = kwargs.pop(ix)
+    items = []
 
     # Allow for flexible range arguments
-    ni = ni if isinstance(ni, Iterable) else [ni]
+    for i in range(*(ni if isinstance(ni, Iterable) else [ni])):
+        if kwargs:
+            items.append(array(context, expr_, vals_ | {ix: i}, **kwargs))
+        else:
+            items.append(expr_.format_map(vals_ | {ix: i}))
 
-    return '{ ' + ', '.join(ex_.format(**{ix: i}) for i in range(*ni)) + ' }'
+    return '{ ' + ', '.join(items) + ' }'
+
+
+def polyfit(context, f, a, b, n, var, nqpts=500):
+    x = np.linspace(a, b, nqpts)
+    y = f(x)
+
+    coeffs = np.polynomial.polynomial.polyfit(x, y, n)
+    pfexpr = f' + {var}*('.join(str(c) for c in coeffs) + ')'*n
+
+    return f'({pfexpr})'
 
 
 def _strip_parens(s):
@@ -66,19 +81,27 @@ def _locals(body):
     # A statement can define multiple variables, so split by ','
     decls = it.chain.from_iterable(d.split(',') for d in decls)
 
-    return [re.match(r'\s*(\w+)', v).group(1) for v in decls]
+    # Extract the variable names
+    lvars = [re.match(r'\s*(\w+)', v)[1] for v in decls]
+
+    # Prune invalid names
+    return [lv for lv in lvars if lv != 'if']
 
 
 @supports_caller
 def macro(context, name, params, externs=''):
     # Check we have not already been defined
     if name in context['_macros']:
-        raise RuntimeError('Attempt to redefine macro "{0}"'
-                           .format(name))
+        raise RuntimeError(f'Attempt to redefine macro "{name}"')
 
     # Split up the parameter and external variable list
     params = [p.strip() for p in params.split(',')]
     externs = [e.strip() for e in externs.split(',')] if externs else []
+
+    # Ensure no invalid characters in params/extern variables
+    for p in it.chain(params, externs):
+        if not re.match(r'[A-Za-z_]\w*$', p):
+            raise ValueError(f'Invalid param "{p}" in macro "{name}"')
 
     # Capture the function body
     body = capture(context, context['caller'].body)
@@ -96,26 +119,37 @@ def macro(context, name, params, externs=''):
     return ''
 
 
-def expand(context, name, *params):
+def expand(context, name, /, *args, **kwargs):
     # Get the macro parameter list and the body
     mparams, mexterns, body = context['_macros'][name]
 
-    # Validate the parameters
-    if len(mparams) != len(params):
-        raise ValueError('Inconsistent macro parameter list in {0} {1}, {2}'
-                         .format(name, list(mparams), list(params)))
+    # Ensure an appropriate number of arguments have been passed
+    if len(mparams) != len(args) + len(kwargs):
+        raise ValueError(f'Inconsistent macro parameter list in {name}')
+
+    # Parse the parameter list
+    params = dict(zip(mparams, args))
+    for k, v in kwargs.items():
+        if k in params:
+            raise ValueError(f'Duplicate macro parameter {k} in {name}')
+
+        params[k] = v
+
+    # Ensure all parameters have been passed
+    if sorted(mparams) != sorted(params):
+        raise ValueError(f'Inconsistent macro parameter list in {name}')
 
     # Ensure all (used) external parameters have been passed to the kernel
     for extrn in mexterns:
         if (extrn not in context['_extrns'] and
-            re.search(r'\b{0}\b'.format(extrn), body)):
-            raise ValueError('Missing external {1} in {0}'.format(name, extrn))
+            re.search(rf'\b{extrn}\b', body)):
+            raise ValueError(f'Missing external {extrn} in {name}')
 
     # Rename local parameters
-    for name, subst in zip(mparams, params):
-        body = re.sub(r'\b{0}\b'.format(name), subst, body)
+    for lname, subst in params.items():
+        body = re.sub(rf'\b{lname}\b', str(subst), body)
 
-    return '{\n' + body + '\n}'
+    return f'{{\n{body}\n}}'
 
 
 @supports_caller
@@ -133,11 +167,12 @@ def kernel(context, name, ndim, **kwargs):
     # Capture the kernel body
     body = capture(context, context['caller'].body)
 
-    # Get the generator class and floating point data type
-    kerngen, fpdtype = context['_kernel_generator'], context['fpdtype']
+    # Get the generator class and data types
+    kerngen = context['_kernel_generator']
+    fpdtype, ixdtype = context['fpdtype'], context['ixdtype']
 
     # Instantiate
-    kern = kerngen(name, int(ndim), kwargs, body, fpdtype)
+    kern = kerngen(name, int(ndim), kwargs, body, fpdtype, ixdtype)
 
     # Save the argument/type list for later use
     context['_kernel_argspecs'][name] = kern.argspec()

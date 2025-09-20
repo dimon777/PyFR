@@ -1,24 +1,31 @@
-# -*- coding: utf-8 -*-
 <%inherit file='base'/>
+<%namespace module='pyfr.backends.base.makoutil' name='pyfr'/>
 
-void
-pack_view(int n, int nrv, int ncv,
-          const fpdtype_t *__restrict__ v,
-          const int *__restrict__ vix,
-          const int *__restrict__ vrstri,
-          fpdtype_t *__restrict__  pmat)
+struct kargs
 {
-    if (ncv == 1)
-        for (int i = 0; i < n; i++)
-            pmat[i] = v[vix[i]];
-    else if (nrv == 1)
-        for (int i = 0; i < n; i++)
-            for (int c = 0; c < ncv; c++)
-                pmat[c*n + i] = v[vix[i] + SOA_SZ*c];
-    else
-        for (int i = 0; i < n; i++)
-            for (int r = 0; r < nrv; r++)
-                for (int c = 0; c < ncv; c++)
-                    pmat[(r*ncv + c)*n + i] = v[vix[i] + vrstri[i]*r +
-                                                SOA_SZ*c];
+    ixdtype_t n;
+    fpdtype_t *v;
+    ixdtype_t *vix, *vrstri;
+    fpdtype_t *pmat;
+};
+
+void pack_view(const struct kargs *restrict args)
+{
+    ixdtype_t n = args->n;
+    ixdtype_t *vix = args->vix, *vrstri = args->vrstri;
+    fpdtype_t *v = args->v, *pmat = args->pmat;
+
+    #pragma omp simd
+    for (ixdtype_t i = 0; i < n; i++)
+    {
+    % if nrv == 1:
+    % for c in range(ncv):
+        pmat[${c}*n + i] = v[vix[i] + SOA_SZ*${c}];
+    % endfor
+    % else:
+    % for r, c in pyfr.ndrange(nrv, ncv):
+        pmat[${r*ncv + c}*n + i] = v[vix[i] + vrstri[i]*${r} + SOA_SZ*${c}];
+    % endfor
+    % endif
+    }
 }

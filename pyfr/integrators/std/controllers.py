@@ -1,23 +1,27 @@
-# -*- coding: utf-8 -*-
-
 import math
 
 import numpy as np
 
 from pyfr.integrators.std.base import BaseStdIntegrator
-from pyfr.mpiutil import get_comm_rank_root, get_mpi
-from pyfr.util import memoize, proxylist
+from pyfr.mpiutil import get_comm_rank_root, mpi
 
 
 class BaseStdController(BaseStdIntegrator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+        # Ensure the system is compatible with our formulation/controller
+        self.system.elementscls.validate_formulation(self)
+
         # Solution filtering frequency
         self._fnsteps = self.cfg.getint('soln-filter', 'nsteps', '0')
 
         # Stats on the most recent step
         self.stepinfo = []
+
+        # Fire off any event handlers if not restarting
+        if not self.isrestart:
+            self._run_plugins()
 
     def _accept_step(self, dt, idxcurr, err=None):
         self.tcurr += dt
@@ -31,11 +35,10 @@ class BaseStdController(BaseStdIntegrator):
         if self._fnsteps and self.nacptsteps % self._fnsteps == 0:
             self.system.filt(idxcurr)
 
-        # Invalidate the solution cache
-        self._curr_soln = None
+        self._invalidate_caches()
 
-        # Fire off any event handlers
-        self.completed_step_handlers(self)
+        # Run any plugins
+        self._run_plugins()
 
         # Clear the step info
         self.stepinfo = []
@@ -53,9 +56,10 @@ class BaseStdController(BaseStdIntegrator):
 
 class StdNoneController(BaseStdController):
     controller_name = 'none'
+    controller_has_variable_dt = False
 
     @property
-    def _controller_needs_errest(self):
+    def controller_needs_errest(self):
         return False
 
     def advance_to(self, t):
@@ -75,6 +79,7 @@ class StdNoneController(BaseStdController):
 
 class StdPIController(BaseStdController):
     controller_name = 'pi'
+    controller_has_variable_dt = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -88,14 +93,20 @@ class StdPIController(BaseStdController):
         self._atol = self.cfg.getfloat(sect, 'atol')
         self._rtol = self.cfg.getfloat(sect, 'rtol')
 
+        if self._atol < 10*self.backend.fpdtype_eps:
+            raise ValueError('Absolute tolerance too small')
+
+        if self._rtol < 10*self.backend.fpdtype_eps:
+            raise ValueError('Relative tolerance too small')
+
         # Error norm
         self._norm = self.cfg.get(sect, 'errest-norm', 'l2')
         if self._norm not in {'l2', 'uniform'}:
             raise ValueError('Invalid error norm')
 
         # PI control values
-        self._alpha = self.cfg.getfloat(sect, 'pi-alpha', 0.7)
-        self._beta = self.cfg.getfloat(sect, 'pi-beta', 0.4)
+        self._alpha = self.cfg.getfloat(sect, 'pi-alpha', 0.58)
+        self._beta = self.cfg.getfloat(sect, 'pi-beta', 0.42)
 
         # Estimate of previous error
         self._errprev = 1.0
@@ -105,40 +116,44 @@ class StdPIController(BaseStdController):
         self._maxfac = self.cfg.getfloat(sect, 'max-fact', 2.5)
         self._minfac = self.cfg.getfloat(sect, 'min-fact', 0.3)
 
+        if not self._minfac < 1 <= self._maxfac:
+            raise ValueError('Invalid max-fact, min-fact')
+
     @property
-    def _controller_needs_errest(self):
+    def controller_needs_errest(self):
         return True
 
-    @memoize
-    def _get_errest_kerns(self):
-        return self._get_kernels('errest', nargs=3, norm=self._norm)
-
-    def _errest(self, x, y, z):
+    def _errest(self, rcurr, rprev, rerr):
         comm, rank, root = get_comm_rank_root()
 
-        errest = self._get_errest_kerns()
+        # Get a set of kernels to estimate the integration error
+        ekerns = self._get_reduction_kerns(rcurr, rprev, rerr, method='errest',
+                                           norm=self._norm)
 
-        # Obtain an estimate for the squared error
-        self._prepare_reg_banks(x, y, z)
-        self._queue % errest(self._atol, self._rtol)
+        # Bind the dynamic arguments
+        for kern in ekerns:
+            kern.bind(self._atol, self._rtol)
 
-        # L2 norm
+        # Run the kernels
+        self.backend.run_kernels(ekerns, wait=True)
+
+        # Pseudo L2 norm
         if self._norm == 'l2':
             # Reduce locally (element types + field variables)
-            err = np.array([sum(v for e in errest.retval for v in e)])
+            err = np.array([sum(v for k in ekerns for v in k.retval)])
 
             # Reduce globally (MPI ranks)
-            comm.Allreduce(get_mpi('in_place'), err, op=get_mpi('sum'))
+            comm.Allreduce(mpi.IN_PLACE, err, op=mpi.SUM)
 
             # Normalise
             err = math.sqrt(float(err) / self._gndofs)
-        # L^∞ norm
+        # Uniform norm
         else:
             # Reduce locally (element types + field variables)
-            err = np.array([max(v for e in errest.retval for v in e)])
+            err = np.array([max(v for k in ekerns for v in k.retval)])
 
             # Reduce globally (MPI ranks)
-            comm.Allreduce(get_mpi('in_place'), err, op=get_mpi('max'))
+            comm.Allreduce(mpi.IN_PLACE, err, op=mpi.MAX)
 
             # Normalise
             err = math.sqrt(float(err))
@@ -153,7 +168,7 @@ class StdPIController(BaseStdController):
         maxf = self._maxfac
         minf = self._minfac
         saff = self._saffac
-        sord = self._stepper_order
+        sord = self.stepper_order
 
         expa = self._alpha / sord
         expb = self._beta / sord
@@ -166,7 +181,7 @@ class StdPIController(BaseStdController):
             idxcurr, idxprev, idxerr = self.step(self.tcurr, dt)
 
             # Estimate the error
-            err = self._errest(idxerr, idxcurr, idxprev)
+            err = self._errest(idxcurr, idxprev, idxerr)
 
             # Determine time step adjustment factor
             fac = err**-expa * self._errprev**expb

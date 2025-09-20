@@ -1,54 +1,117 @@
-# -*- coding: utf-8 -*-
+from weakref import WeakKeyDictionary
 
-from pycuda import compiler, driver
-
-from pyfr.backends.base import (BaseKernelProvider,
-                                BasePointwiseKernelProvider, ComputeKernel)
-import pyfr.backends.cuda.generator as generator
-from pyfr.util import memoize
+from pyfr.backends.base import (BaseKernelProvider, BaseOrderedMetaKernel,
+                                BasePointwiseKernelProvider,
+                                BaseUnorderedMetaKernel, Kernel)
+from pyfr.backends.cuda.compiler import CUDACompilerModule
+from pyfr.backends.cuda.generator import CUDAKernelGenerator
+from pyfr.cache import memoize
 
 
 def get_grid_for_block(block, nrow, ncol=1):
-    return (int((nrow + (-nrow % block[0])) // block[0]),
-            int((ncol + (-ncol % block[1])) // block[1]))
+    return (-(-nrow // block[0]), -(-ncol // block[1]), 1)
+
+
+class CUDAKernel(Kernel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        if hasattr(self, 'bind') and hasattr(self, 'add_to_graph'):
+            self.gnodes = WeakKeyDictionary()
+
+
+class CUDAOrderedMetaKernel(BaseOrderedMetaKernel):
+    def add_to_graph(self, graph, dnodes):
+        for k in self.kernels:
+            dnodes = [k.add_to_graph(graph, dnodes)]
+
+        return dnodes[0]
+
+
+class CUDAUnorderedMetaKernel(BaseUnorderedMetaKernel):
+    def add_to_graph(self, graph, dnodes):
+        nodes = [k.add_to_graph(graph, dnodes) for k in self.kernels]
+
+        return graph.graph.add_empty(nodes)
 
 
 class CUDAKernelProvider(BaseKernelProvider):
     @memoize
-    def _build_kernel(self, name, src, argtypes):
-        # Compile the source code and retrieve the kernel
-        fun = compiler.SourceModule(src).get_function(name)
+    def _build_kernel(self, name, src, argtypes, argn=[]):
+        mod = CUDACompilerModule(self.backend, src)
+        return mod.get_function(name, argtypes)
 
-        # Prepare the kernel for execution
-        fun.prepare(argtypes)
+    def _benchmark(self, kfunc, nbench=4, nwarmup=1):
+        stream = self.backend.cuda.create_stream()
+        start_evt = self.backend.cuda.create_event(timing=True)
+        stop_evt = self.backend.cuda.create_event(timing=True)
 
-        # Declare a preference for L1 cache over shared memory
-        fun.set_cache_config(driver.func_cache.PREFER_L1)
+        for i in range(nbench + nwarmup):
+            if i == nwarmup:
+                start_evt.record(stream)
 
-        return fun
+            kfunc(stream)
+
+        stop_evt.record(stream)
+        stream.synchronize()
+
+        return stop_evt.elapsed_time(start_evt) / nbench
 
 
 class CUDAPointwiseKernelProvider(CUDAKernelProvider,
                                   BasePointwiseKernelProvider):
-    kernel_generator_cls = generator.CUDAKernelGenerator
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
-    def _instantiate_kernel(self, dims, fun, arglst):
-        cfg = self.backend.cfg
+        self._block1d = (64, 1, 1)
+        self._block2d = (32, 8, 1)
 
-        # Determine the block size
-        if len(dims) == 1:
-            block = (cfg.getint('backend-cuda', 'block-1d', '64'), 1, 1)
-        else:
-            block = cfg.getliteral('backend-cuda', 'block-2d', '128, 1')
-            block += (1,)
+        # Pass these block sizes to the generator
+        class KernelGenerator(CUDAKernelGenerator):
+            block1d = self._block1d
+            block2d = self._block2d
 
-        # Use this to compute the grid size
-        grid = get_grid_for_block(block, *dims[::-1])
+        self.kernel_generator_cls = KernelGenerator
 
-        class PointwiseKernel(ComputeKernel):
-            def run(self, queue, **kwargs):
-                narglst = [kwargs.get(ka, ka) for ka in arglst]
-                fun.prepared_async_call(grid, block, queue.cuda_stream_comp,
-                                        *narglst)
+    def _instantiate_kernel(self, dims, fun, arglst, argm, argv):
+        rtargs = []
+        block = self._block1d if len(dims) == 1 else self._block2d
+        grid = get_grid_for_block(block, dims[-1])
 
-        return PointwiseKernel()
+        # Set shared memory carveout locally for kernel
+        fun.set_shared_size(carveout=25 if fun.shared_mem else 0)
+
+        params = fun.make_params(grid, block)
+
+        # Process the arguments
+        for i, k in enumerate(arglst):
+            if isinstance(k, str):
+                rtargs.append((i, k))
+            else:
+                params.set_arg(i, k)
+
+        class PointwiseKernel(CUDAKernel):
+            if rtargs:
+                def bind(self, **kwargs):
+                    for i, k in rtargs:
+                        if k in kwargs:
+                            params.set_arg(i, kwargs[k])
+
+                    # Notify any graphs we're in about our new parameters
+                    for graph, gnode in self.gnodes.items():
+                        graph.stale_kparams[gnode] = params
+
+            def add_to_graph(self, graph, deps):
+                gnode = graph.graph.add_kernel(params, deps)
+
+                # If our parameters can change then we need to keep a
+                # (weak) reference to the graph so we can notify it
+                if rtargs:
+                    self.gnodes[graph] = gnode
+
+                return gnode
+
+            def run(self, stream):
+                fun.exec_async(stream, params)
+
+        return PointwiseKernel(argm, argv)

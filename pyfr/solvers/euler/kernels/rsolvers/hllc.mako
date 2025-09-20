@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 <%namespace module='pyfr.backends.base.makoutil' name='pyfr'/>
 <%include file='pyfr.solvers.euler.kernels.flux'/>
 
@@ -6,9 +5,9 @@
     // Compute the left and right fluxes + velocities and pressures
     fpdtype_t fl[${ndims}][${nvars}], fr[${ndims}][${nvars}];
     fpdtype_t vl[${ndims}], vr[${ndims}];
-    fpdtype_t pl, pr;
-    fpdtype_t nf_fl, nf_fr, nf_flstar, nf_frstar, d_star;
-    fpdtype_t rcp_lstar, rcp_rstar;
+    fpdtype_t pl, pr, nf_fl, nf_fr, nf_fsl, nf_fsr;
+    fpdtype_t va[${ndims}];
+    fpdtype_t usl[${nvars}], usr[${nvars}];
 
     ${pyfr.expand('inviscid_flux', 'ul', 'fl', 'pl', 'vl')};
     ${pyfr.expand('inviscid_flux', 'ur', 'fr', 'pr', 'vr')};
@@ -16,6 +15,9 @@
     // Get the normal left and right velocities
     fpdtype_t nvl = ${pyfr.dot('n[{i}]', 'vl[{i}]', i=ndims)};
     fpdtype_t nvr = ${pyfr.dot('n[{i}]', 'vr[{i}]', i=ndims)};
+
+    fpdtype_t al = sqrt(${c['gamma']}*pl/ul[0]);
+    fpdtype_t ar = sqrt(${c['gamma']}*pr/ur[0]);
 
     // Compute the Roe-averaged velocity
     fpdtype_t nv = (sqrt(ul[0])*nvl + sqrt(ur[0])*nvr)
@@ -26,38 +28,50 @@
                  + sqrt(ur[0])*(pl + ul[${ndims + 1}]))
                 / (sqrt(ul[0])*ur[0] + sqrt(ur[0])*ul[0]);
 
-    // Roe average sound speed
-    fpdtype_t a = sqrt(${c['gamma'] - 1}*(H - 0.5*nv*nv));
+    fpdtype_t inv_rar = 1 / (sqrt(ul[0]) + sqrt(ur[0]));
+% for i in range(ndims):
+    va[${i}] = (vl[${i}]*sqrt(ul[0]) + vr[${i}]*sqrt(ur[0])) * inv_rar;
+% endfor
+
+    fpdtype_t qq = ${pyfr.dot('va[{i}]', i=ndims)};
+    
+    // Roe average speed of sound
+    fpdtype_t a = sqrt(${c['gamma'] - 1}*(H - 0.5*qq));
 
     // Estimate the left and right wave speed, sl and sr
-    fpdtype_t sl = nv - a;
-    fpdtype_t sr = nv + a;
-    fpdtype_t s_star = (pr - pl + ul[0]*nvl*(sl - nvl) -
-                        ur[0]*nvr*(sr - nvr)) /
-                       (ul[0]*(sl - nvl) - ur[0]*(sr - nvr));
+    fpdtype_t sl = min(nv - a, nvl - al);
+    fpdtype_t sr = max(nv + a, nvr + ar);
+    fpdtype_t sstar = (pr - pl + ul[0]*nvl*(sl - nvl)
+                               - ur[0]*nvr*(sr - nvr)) /
+                      (ul[0]*(sl - nvl) - ur[0]*(sr - nvr));
+
+    // Star state common factors
+    fpdtype_t ul_com = (sl - nvl) / (sl - sstar);
+    fpdtype_t ur_com = (sr - nvr) / (sr - sstar);
+
+    // Star state mass
+    usl[0] = ul_com*ul[0];
+    usr[0] = ur_com*ur[0];
+
+    // Star state momenetum
+% for i in range(ndims):
+    usl[${i + 1}] = usl[0]*(vl[${i}] + (sstar - nvl)*n[${i}]);
+    usr[${i + 1}] = usr[0]*(vr[${i}] + (sstar - nvr)*n[${i}]);
+%endfor 
+
+    // Star state energy
+    usl[${nvars - 1}] = ul_com*(ul[${nvars - 1}] + (sstar - nvl)*
+                                (ul[0]*sstar + pl/(sl - nvl)));
+    usr[${nvars - 1}] = ur_com*(ur[${nvars - 1}] + (sstar - nvr)*
+                                (ur[0]*sstar + pr/(sr - nvr)));
 
     // Output
-    rcp_lstar = 1 / (sl - s_star);
-    rcp_rstar = 1 / (sr - s_star);
 % for i in range(nvars):
-    nf_fl = ${' + '.join('n[{j}]*fl[{j}][{i}]'.format(i=i, j=j)
-                         for j in range(ndims))};
-    nf_fr = ${' + '.join('n[{j}]*fr[{j}][{i}]'.format(i=i, j=j)
-                         for j in range(ndims))};
-% if i == 0:
-    nf_flstar = s_star*(sl*ul[${i}] - nf_fl) * rcp_lstar;
-    nf_frstar = s_star*(sr*ur[${i}] - nf_fr) * rcp_rstar;
-% else:
-    d_star = ${'s_star' if i == nvars - 1 else 'n[{0}]'.format(i - 1)};
-    nf_flstar = (s_star*(sl*ul[${i}] - nf_fl) +
-                 sl*(pl + ul[0]*(sl - nvl)*(s_star - nvl))*d_star) *
-                rcp_lstar;
-    nf_frstar = (s_star*(sr*ur[${i}] - nf_fr) +
-                 sr*(pr + ur[0]*(sr - nvr)*(s_star - nvr))*d_star) *
-                rcp_rstar;
-% endif
-
-    nf[${i}] = (sl >= 0) ? nf_fl : (sl <= 0 && s_star >= 0) ? nf_flstar :
-               (s_star <= 0 && sr >= 0) ? nf_frstar : nf_fr;
+    nf_fl = ${' + '.join(f'n[{j}]*fl[{j}][{i}]' for j in range(ndims))};
+    nf_fr = ${' + '.join(f'n[{j}]*fr[{j}][{i}]' for j in range(ndims))};
+    nf_fsl = nf_fl + sl*(usl[${i}] - ul[${i}]);
+    nf_fsr = nf_fr + sr*(usr[${i}] - ur[${i}]);
+    nf[${i}] = (0 <= sl) ? nf_fl : (sl <= 0 && 0 <= sstar) ? nf_fsl :
+               (sstar <= 0 && 0 <= sr) ? nf_fsr : nf_fr;
 % endfor
 </%pyfr:macro>
